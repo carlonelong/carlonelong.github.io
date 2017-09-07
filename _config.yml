@@ -4,3 +4,7 @@ description: 杂谈
 show_downloads: false 
 google_analytics:
 theme: jekyll-theme-hacker
+paginate: 10
+plugins:
+  - jekyll-paginate
+  - jekyll-gist
