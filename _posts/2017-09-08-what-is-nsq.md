@@ -11,39 +11,39 @@ title: NSQ是什么
 我们在开发过程中多次用到了NSQ，所以我认为应该更加深入地了解它。
 那么为什么需要用到NSQ呢？可能不同的人有不同的用法。我们使用了它的最主要的两个特性：解耦和缓冲。
 比如工作流每执行一步之后发送到调用者的调用状态（成功or失败），转码后的消息回调，以及转码过程中更新完DB后更新Redis的操作，都是用NSQ来完成的。
-至于为什么用NSQ而不是Kafka或者RabbitMQ之类，主要是因为我们这边都是go的代码，NSQ让生态显得比较统一。
+至于为什么用NSQ而不是Kafka或者RabbitMQ之类，主要是因为我们这边都是go的代码，使用NSQ接入别的如监控等服务比较方便，同时让生态显得比较统一。
 
 如果你使用一个消息队列，你最关心的特性是什么呢？
 我们最关注的有这几点：
-* 消息即时性，反映在数据上就是pct99。
-* 消息完备性，即无论生产者发送了多少消息，消费者都能完全读到，不会丢失消息或者其中的某一部分。 
-* 消息可重读，即多个消费者都能读出相同的数据（不特别过滤的条件下） 
-* 容灾性能，即没有单点故障，能快速扩容，便于监控，支持降级，故障中能迅速恢复，不丢失数据。
+1. 消息即时性，反映在数据上就是pct99。
+2. 消息完备性，即无论生产者发送了多少消息，消费者都能完全读到，不会丢失消息或者其中的某一部分。 
+3. 消息可重读，即多个消费者都能读出相同的数据（不特别过滤的条件下） 
+4. 容灾性能，即没有单点故障，能快速扩容，便于监控，支持降级，故障中能迅速恢复，不丢失数据。
 
 查看NSQ的主页（http://nsq.io/overview/features_and_guarantees.html），我们能找到官方对于这些要求的描述。
-'''
-Features:
-> support distributed topologies with no SPOF
-> horizontally scalable (no brokers, seamlessly add more nodes to the cluster)
-> low-latency push based message delivery (performance)
-> combination load-balanced and multicast style message routing
-> excel at both streaming (high-throughput) and job oriented (low-throughput) workloads
-> primarily in-memory (beyond a high-water mark messages are transparently kept on disk)
-> runtime discovery service for consumers to find producers (nsqlookupd)
-> transport layer security (TLS)
-> data format agnostic
-> few dependencies (easy to deploy) and a sane, bounded, default configuration
-> simple TCP protocol supporting client libraries in any language
-> HTTP interface for stats, admin actions, and producers (no client library needed to publish)
-> integrates with statsd for realtime instrumentation
-> robust cluster administration interface (nsqadmin)
+```
+Features
+• support distributed topologies with no SPOF
+• horizontally scalable (no brokers, seamlessly add more nodes to the cluster)
+• low-latency push based message delivery (performance)
+• combination load-balanced and multicast style message routing
+• excel at both streaming (high-throughput) and job oriented (low-throughput) workloads
+• primarily in-memory (beyond a high-water mark messages are transparently kept on disk)
+• runtime discovery service for consumers to find producers (nsqlookupd)
+• transport layer security (TLS)
+• data format agnostic
+• few dependencies (easy to deploy) and a sane, bounded, default configuration
+• simple TCP protocol supporting client libraries in any language
+• HTTP interface for stats, admin actions, and producers (no client library needed to publish)
+• integrates with statsd for realtime instrumentation
+• robust cluster administration interface (nsqadmin)
 
 Guarantees
-messages are not durable (by default)
-messages are delivered at least once
-messages received are un-ordered
-consumers eventually find all topic producers
-'''
+• messages are not durable (by default)
+• messages are delivered at least once
+• messages received are un-ordered
+• consumers eventually find all topic producers
+```
 可见NSQ都能很好地满足我们的需求，同时还将稳定性放在了一个很重要的位置。在以后的若干篇文章内，我会根据代码来分析这些特性的实现。
 
 ## 你想象中的NSQ实现
