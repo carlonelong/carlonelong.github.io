@@ -1,5 +1,7 @@
 ---
-layout: post 
+layout: article-detail
+category: 代码阅读 
+author: 龙飞 
 title: 我阅读代码的方法 
 ---
 

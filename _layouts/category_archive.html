@@ -1,0 +1,15 @@
+---
+layout: default
+---
+<div class="category-archive">
+  {% for category in site.categories %}
+      <div>
+        <span class="title">{{ category.first}}</span>
+      </div>
+  {% endfor %}
+  <div>
+    <ul>
+{{ content }}
+    </ul>
+  </div>
+</div>
