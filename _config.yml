@@ -42,7 +42,7 @@ paginate_path: "article/:num"
 
 # 转换
 markdown: kramdown
-highlighter: pygments 
+highlighter: rouge 
 excerpt_separator: <!--excerpt-->
 
 plugins: ['jekyll-paginate']
