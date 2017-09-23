@@ -35,38 +35,25 @@
         <div class="col-md-2 hidden-xs">
             <div class="sidebar well">
     
-        <h1>笔记分类</h1>
-
-<ul>
-    <li><a href="/category/代码阅读.html">代码阅读（1）</a></li>
-</ul>
-
-<ul>
-    <li><a href="/category/工作记录.html">工作记录（1）</a></li>
-</ul>
-
-<ul>
-    <li><a href="/category/nsq.html">nsq（2）</a></li>
-</ul>
-
-
-    
 </div>
 
         </div>
         <div class="col-md-8">
-            
-            
-<div class="article">
-    <div class="well">
-        <h1 class="none"><a href="/2017/09/17/nsq-topic.html">NSQ Topic （2017年09月17日）</a></h1>
-        <div class="content"><a href="../../09/08/what-is-nsq">第一篇文章</a>提到了，本着从简单到复杂的原则，我们会从nsqd开始对NSQ进行分析。
+            <div class="article">
+                <div class="well">
+                    <h1 class="none title">NSQ Topic</h1>
+                    <div class="text-muted time">
+                        <span>发布时间：2017年09月17日</span>
+                        <span class="col-md-offset-1">作者：龙飞</span>
+                    </div>
+                    <div class="content">
+                        <p><a href="../../09/08/what-is-nsq">第一篇文章</a>提到了，本着从简单到复杂的原则，我们会从nsqd开始对NSQ进行分析。</p>
 <h2 id="nsqd组成">nsqd组成</h2>
-先从官网上偷一张示意图
+<p>先从官网上偷一张示意图</p>
 
-<img src="../../../nsqd.gif" alt="" />
+<p><img src="../../../nsqd.gif" alt="" /></p>
 
-从图中可以看出
+<p>从图中可以看出</p>
 <ol>
   <li>一个topic下对应多个channel</li>
   <li>一个channel下对应多个consumer</li>
@@ -75,13 +62,13 @@
   <li>如果一个channel的消息一直不被消费，会一直堆积</li>
 </ol>
 
-我们可以得出以下几点推论：
+<p>我们可以得出以下几点推论：</p>
 <ol>
   <li>如果两个消费者都想要获得全部消息，那么他们必须在独立的channel下。比如硬盘备份和打印metrics。</li>
   <li>即使consumer在channel创建之后才注册，在堆积不超过nsqd前提下，仍然能获取到所有消息。</li>
 </ol>
 
-同样也会有疑问，比如：
+<p>同样也会有疑问，比如：</p>
 <ol>
   <li>每个channel的堆积上限是多少？超过上限之后处理逻辑是什么？</li>
   <li>多个consumer消费同一个channel采用什么样的分配策略，是否公平？</li>
@@ -89,9 +76,9 @@
   <li>如何保证同一channel下一条消息不会发送到多个consumer?</li>
 </ol>
 
-带着这些问题，我们进入代码的世界。
+<p>带着这些问题，我们进入代码的世界。</p>
 <h2 id="topic">topic</h2>
-topic的代码很好找，在nsqd/topic.go里面。首先看看topic的定义：
+<p>topic的代码很好找，在nsqd/topic.go里面。首先看看topic的定义：</p>
 <div class="highlighter-rouge"><pre class="highlight"><code>type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	messageCount uint64
@@ -119,12 +106,12 @@ topic的代码很好找，在nsqd/topic.go里面。首先看看topic的定义：
 }
 </code></pre>
 </div>
-不妨先根据字面意思和之前的分析来猜测一下，Topic里面各个字段的含义。
-messageCount毫无疑问是消息的条数；name是topic的名字；channelMap是用来存储不同channel的；sync.RWMutex是读写锁，猜测是控制多个channel的同步用的……
+<p>不妨先根据字面意思和之前的分析来猜测一下，Topic里面各个字段的含义。
+messageCount毫无疑问是消息的条数；name是topic的名字；channelMap是用来存储不同channel的；sync.RWMutex是读写锁，猜测是控制多个channel的同步用的……</p>
 
-几个chan的含义都比较明显，比较奇怪的是backend这个字段，看起来略显突兀，似乎和队列的堆积有些关系。ephemeral用来标志topic是临时有效的，不知道会有怎么样的处理呢？
+<p>几个chan的含义都比较明显，比较奇怪的是backend这个字段，看起来略显突兀，似乎和队列的堆积有些关系。ephemeral用来标志topic是临时有效的，不知道会有怎么样的处理呢？</p>
 
-那么从topic的生命周期来寻找答案吧。
+<p>那么从topic的生命周期来寻找答案吧。</p>
 <h3 id="create-topic">create topic</h3>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="n">NewTopic</span><span class="p">(</span><span class="n">topicName</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">ctx</span><span class="x"> </span><span class="o">*</span><span class="n">context</span><span class="p">,</span><span class="x"> </span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Topic</span><span class="p">))</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="x"> </span><span class="p">{</span><span class="x">
@@ -167,11 +154,11 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 	</span><span class="k">return</span><span class="x"> </span><span class="n">t</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-好吧，搞了半天也没搞定代码显示行号的问题。。。。。。
+<p>好吧，搞了半天也没搞定代码显示行号的问题。。。。。。</p>
 
-关注第14行，这里有对ephemeral的判断，如果topicName有这个后缀，那么backend就是假的，否则就会起一个diskqueue来做backend。从diskqueue的名字猜测，这是一个存储在磁盘上的队列。因此我们之前的猜测大体是正确的：topic的消息太多时，会存在磁盘里面。对这个diskqueue的分析，我们以后再做。
+<p>关注第14行，这里有对ephemeral的判断，如果topicName有这个后缀，那么backend就是假的，否则就会起一个diskqueue来做backend。从diskqueue的名字猜测，这是一个存储在磁盘上的队列。因此我们之前的猜测大体是正确的：topic的消息太多时，会存在磁盘里面。对这个diskqueue的分析，我们以后再做。</p>
 
-再看一个有意思的用法
+<p>再看一个有意思的用法</p>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">w</span><span class="x"> </span><span class="o">*</span><span class="n">WaitGroupWrapper</span><span class="p">)</span><span class="x"> </span><span class="n">Wrap</span><span class="p">(</span><span class="n">cb</span><span class="x"> </span><span class="k">func</span><span class="p">())</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">w</span><span class="o">.</span><span class="n">Add</span><span class="p">(</span><span class="m">1</span><span class="p">)</span><span class="x">
@@ -181,9 +168,9 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 	</span><span class="p">}()</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-这是waitGroup的Wrap操作，把cb封装起来。注意这里没有Wait操作，所以并不会阻塞。那么阻塞在哪里呢？搜代码可以发现，在topic的exit操作中。
+<p>这是waitGroup的Wrap操作，把cb封装起来。注意这里没有Wait操作，所以并不会阻塞。那么阻塞在哪里呢？搜代码可以发现，在topic的exit操作中。</p>
 
-也就是说，这个waitGroup的作用是：在退出topic之前，一定要保证cb（这里是messagePump）执行完成。从名字上看，messagePump就是topic不断往各个channel发送消息的过程，这个我们留在后面分析。
+<p>也就是说，这个waitGroup的作用是：在退出topic之前，一定要保证cb（这里是messagePump）执行完成。从名字上看，messagePump就是topic不断往各个channel发送消息的过程，这个我们留在后面分析。</p>
 <h3 id="create-channel">create channel</h3>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">GetChannel</span><span class="p">(</span><span class="n">channelName</span><span class="x"> </span><span class="kt">string</span><span class="p">)</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="x"> </span><span class="p">{</span><span class="x">
@@ -202,9 +189,9 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 	</span><span class="k">return</span><span class="x"> </span><span class="n">channel</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-代码很清楚：给定一个channel name，如果对应的channel已经存在，就返回，否则创建一个新的。对于topic也有一样的逻辑（在nsqd中）。所以如果没有对topic和name做别的限制，你想怎么用就怎么用。这里的channelUpdateChan是用来告诉messagePump：我又创建了一个channel，下次别忘了把消息发给它。
+<p>代码很清楚：给定一个channel name，如果对应的channel已经存在，就返回，否则创建一个新的。对于topic也有一样的逻辑（在nsqd中）。所以如果没有对topic和name做别的限制，你想怎么用就怎么用。这里的channelUpdateChan是用来告诉messagePump：我又创建了一个channel，下次别忘了把消息发给它。</p>
 <h3 id="接收消息">接收消息</h3>
-topic创建好之后，producer就可以往这个topic下面发消息了。
+<p>topic创建好之后，producer就可以往这个topic下面发消息了。</p>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">PutMessage</span><span class="p">(</span><span class="n">m</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">t</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
@@ -238,15 +225,15 @@ topic创建好之后，producer就可以往这个topic下面发消息了。
 	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-这里的逻辑也很简单，消息来到后，尝试往memoryMsgChan里面写。如果阻塞了，就往backend里面写。所以，不需要担心消息写不下，只要磁盘有空间就没问题。那么怎么知道堆积了多少消息呢？
+<p>这里的逻辑也很简单，消息来到后，尝试往memoryMsgChan里面写。如果阻塞了，就往backend里面写。所以，不需要担心消息写不下，只要磁盘有空间就没问题。那么怎么知道堆积了多少消息呢？</p>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">Depth</span><span class="p">()</span><span class="x"> </span><span class="kt">int64</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="k">return</span><span class="x"> </span><span class="kt">int64</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="p">))</span><span class="x"> </span><span class="o">+</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">Depth</span><span class="p">()</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-那么写往memoryMsgChan的消息又哪儿去了呢？很显然，要发送到每个channel去了。怎么发的呢？是的，messagePump！
+<p>那么写往memoryMsgChan的消息又哪儿去了呢？很显然，要发送到每个channel去了。怎么发的呢？是的，messagePump！</p>
 <h3 id="消息转发">消息转发</h3>
-终于到消息转发了，激不激动？
+<p>终于到消息转发了，激不激动？</p>
 
 <figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">messagePump</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="k">var</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="x">
@@ -332,7 +319,7 @@ topic创建好之后，producer就可以往这个topic下面发消息了。
 	</span><span class="n">t</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_INFO</span><span class="p">,</span><span class="x"> </span><span class="s">"TOPIC(%s): closing ... messagePump"</span><span class="p">,</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">)</span><span class="x">
 </span><span class="p">}</span></code></pre></figure>
 
-在一个比较大的for循环里，messagePump对几类消息做了不同的处理
+<p>在一个比较大的for循环里，messagePump对几类消息做了不同的处理</p>
 <ol>
   <li>memoryMsgChan或者backendChan，表示真实的消息内容，区别在于后者是编码后存入磁盘的，所以需要多一道解码的工序。</li>
   <li>channelUpdateChan，前面提到过，这里是用来刷新channel的。</li>
@@ -340,358 +327,46 @@ topic创建好之后，producer就可以往这个topic下面发消息了。
   <li>exitChan，退出（想想之前waitGroup)。</li>
 </ol>
 
-从memoryMsgChan或者backendChan拿到消息之后，自然是要写入channel的。根据消息是否deferred，有两种不同方式：
+<p>从memoryMsgChan或者backendChan拿到消息之后，自然是要写入channel的。根据消息是否deferred，有两种不同方式：</p>
 <ol>
   <li>如果不是deferred，直接写入channel</li>
   <li>否则写入channel的deferred priority queue</li>
 </ol>
 
-这里有个小细节，因为要发送到n个channel，原本已经有一个message了，所以把这个message发送到第0个channel，可以减少一次复制的开销。
-从这里可以看到为什么每个channel都能获得所有消息了：他们得到的都是一份拷贝，并不是共享一份消息，这样各个channel之间就不会互相干扰了。
+<p>这里有个小细节，因为要发送到n个channel，原本已经有一个message了，所以把这个message发送到第0个channel，可以减少一次复制的开销。
+从这里可以看到为什么每个channel都能获得所有消息了：他们得到的都是一份拷贝，并不是共享一份消息，这样各个channel之间就不会互相干扰了。</p>
 <h3 id="退出">退出</h3>
-topic有两种退出方式
+<p>topic有两种退出方式</p>
 <ol>
   <li>被delete，这种情况下清空并删除所有channel，通知nsqlookupd本topic已经被删除了。</li>
   <li>被正常close，这种情况下需要把所有数据都写入磁盘，然后关闭所有channel退出。</li>
 </ol>
 
 <h3 id="全景图">全景图</h3>
-前面我们只是介绍了topic在整个生命周期中与别的部分进行的交互，但是还缺乏上层对topic的管理，下图描述了整个流程。
-<img src="../../../nsq_uml.png" alt="" />
+<p>前面我们只是介绍了topic在整个生命周期中与别的部分进行的交互，但是还缺乏上层对topic的管理，下图描述了整个流程。
+<img src="../../../nsq_uml.png" alt="" /></p>
 
-注意图中consumer注册到nsqd可以发生在nsqd启动后的任意时刻。
+<p>注意图中consumer注册到nsqd可以发生在nsqd启动后的任意时刻。</p>
 
 <h3 id="小结">小结</h3>
-本文跟踪了nsqd中topic的整个生命周期，分析了topic与channel的交互流程。
-现在我们可以尝试着回答开始提出的问题的一小部分
+<p>本文跟踪了nsqd中topic的整个生命周期，分析了topic与channel的交互流程。
+现在我们可以尝试着回答开始提出的问题的一小部分</p>
 <ol>
   <li>堆积上限就是磁盘的大小，超过上限的处理策略需要参看diskqueue的处理。</li>
   <li>单机情况下，每个channel都会收到每条消息的完整拷贝，所以不会丢失。多机的情况容以后分析。</li>
 </ol>
 
-接下来两篇文章将会分析diskqueue和channel。
-</div>
-    </div>
-</div>
-
-<div class="article">
-    <div class="well">
-        <h1 class="none"><a href="/2017/09/08/what-is-nsq.html">NSQ是什么 （2017年09月08日）</a></h1>
-        <div class="content">这是NSQ代码阅读笔记的第一遍。之前在如何阅读代码一文中提到了阅读代码之前要先了解项目的用途和功能模块划分。本文试图记录这些信息。
-
-<h2 id="我们为什么需要nsq">我们为什么需要NSQ</h2>
-我们在开发过程中多次用到了NSQ，所以我认为应该更加深入地了解它。
-那么为什么需要用到NSQ呢？可能不同的人有不同的用法。我们使用了它的最主要的两个特性：解耦和缓冲。
-比如工作流每执行一步之后发送到调用者的调用状态（成功or失败），转码后的消息回调，以及转码过程中更新完DB后更新Redis的操作，都是用NSQ来完成的。
-至于为什么用NSQ而不是Kafka或者RabbitMQ之类，主要是因为我们这边都是go的代码，使用NSQ接入别的如监控等服务比较方便，同时让生态显得比较统一。
-
-如果你使用一个消息队列，你最关心的特性是什么呢？
-我们最关注的有这几点：
-<ol>
-  <li>消息即时性，反映在数据上就是pct99。</li>
-  <li>消息完备性，即无论生产者发送了多少消息，消费者都能完全读到，不会丢失消息或者其中的某一部分。</li>
-  <li>消息可重读，即多个消费者都能读出相同的数据（不特别过滤的条件下）</li>
-  <li>容灾性能，即没有单点故障，能快速扩容，便于监控，支持降级，故障中能迅速恢复，不丢失数据。</li>
-</ol>
-
-查看NSQ的主页（http://nsq.io/overview/features_and_guarantees.html），我们能找到官方对于这些要求的描述。
-<div class="highlighter-rouge"><pre class="highlight"><code>Features
-• support distributed topologies with no SPOF
-• horizontally scalable (no brokers, seamlessly add more nodes to the cluster)
-• low-latency push based message delivery (performance)
-• combination load-balanced and multicast style message routing
-• excel at both streaming (high-throughput) and job oriented (low-throughput) workloads
-• primarily in-memory (beyond a high-water mark messages are transparently kept on disk)
-• runtime discovery service for consumers to find producers (nsqlookupd)
-• transport layer security (TLS)
-• data format agnostic
-• few dependencies (easy to deploy) and a sane, bounded, default configuration
-• simple TCP protocol supporting client libraries in any language
-• HTTP interface for stats, admin actions, and producers (no client library needed to publish)
-• integrates with statsd for realtime instrumentation
-• robust cluster administration interface (nsqadmin)
-
-Guarantees
-• messages are not durable (by default)
-• messages are delivered at least once
-• messages received are un-ordered
-• consumers eventually find all topic producers
-</code></pre>
-</div>
-可见NSQ都能很好地满足我们的需求，同时还将稳定性放在了一个很重要的位置。在以后的若干篇文章内，我会根据代码来分析这些特性的实现。
-
-<h2 id="你想象中的nsq实现">你想象中的NSQ实现</h2>
-一个典型的消息队列如何实现呢？如果你熟悉golang，一定会马上想到channel。它同样是一个生产者+消费者的结构，只要channel有数据，就能一直读取，只要channel未满，就能一直写入。其他情况都会阻塞。
-事实上，NSQ最核心的数据结构确实是用channel来实现的。不过，需要增加许多额外的手段来保证上面提到的各种特性。
-比如：为了实现多个消费者读到同样的数据，引入了单个topic下包含多个channel（此channel非go中的chan）的结构；为了保证消息不丢失，引入了diskQueue将数据保存在磁盘上；为了保证消息一定能被消费者完全接受，引入了inFlightQueue；为了实现延时消息，引入了deferedQueue。
-
-阅读别人的代码最好从一个写代码的人的角度来思考：你要了解的这个功能是不是最基础的特性，如果不是，它依赖了哪些特性。就好像你在实现功能的时候先要找到别人提供的API一样。遇到看不懂的代码怎么办？先放在一边，了解了最基础的特性（函数，类之类）之后，再加上Google，一般来说就能很轻松地理解了。
-<h2 id="nsq的组成">NSQ的组成</h2>
-NSQ由nsqd, nsqlookupd和nsqadmin3个守护进程（生产环境中是多个进程，但都是这3种之一）构成。
-<div class="highlighter-rouge"><pre class="highlight"><code>• nsqd is the daemon that receives, queues, and delivers messages to clients.
-• nsqlookupd is the daemon that manages topology information and provides an eventually consistent discovery service.
-• nsqadmin is a web UI to introspect the cluster in realtime (and perform various administrative tasks).
-</code></pre>
-</div>
-nsq是消息收取、存储和分发的主体，在没有其他两个进程的情况下也可以正常运行。
-
-nsqlookupd用来管理nsqd进程的拓扑结构以及服务发现，比如nsqadmin就需要nsqlookupd来找到合适的nsqd进程。
-
-nsqadmin就是用来操作和查看集群信息的UI界面。
-
-事实上我们关注的核心功能都在nsqd中，所以接下来的分析我会先从nsqd开始，在必要的时候引入nsqdlookupd和nsqadmin。
-<h2 id="小结">小结</h2>
-所以NSQ是什么呢？NSQ就是一个消息队列，它能保证消息迅速传达，能保证所有消息不会丢失(除非磁盘满了），至少被传递（到消费者）一次，它能保证多个消费者都能读到同样的数据，它没有单点故障，能快速从错误中恢复。还有一点，它的代码足够简单，而且很gopher范。
-</div>
-    </div>
-</div>
-
-<div class="article">
-    <div class="well">
-        <h1 class="none"><a href="/2017/09/08/migration.html">数据及服务迁移记录 （2017年09月08日）</a></h1>
-        <div class="content">来到头条半年多，从游戏行业跨入互联网行业，看起来差别不大，个中滋味非经历不能体会。除了都用Python写一些东西之外，其他种种都要学习。沉默术士说得好，watch and learn.
-
-这半年参与的最重要的事情就是数据库和数据服务的迁移。当初接到这个任务的时候，天真地以为至多两个月就能搞定，最终却几乎耗费了三倍的时间。这过程中包含了学习的开销，需求的变更带来的花费，与上游沟通的成本，当然更少不了走弯路带来的不必要的额外花销。趁着还没有忘记主要流程，把这部分内容写下来，是有此文。
-<h2 id="我们要做什么">我们要做什么</h2>
-重构之前，我们的数据服务长下图左边这样。
-<img src="../../../video_db.png" alt="" />
-old_db库存放所有视频相关数据，比如原视频存放地址，转码后视频地址，视频数据元信息等。old_service为原来读写数据的服务。vod是点播读取视频地址的服务，只有读请求。others表示其他通过old_service服务访问DB的请求。wildlings表示切换到微服务之前，原来直接读写数据服务的Python客户端。
-
-上述结构的问题是：
-
-• 数据访问不收敛，一个需求变更可能需要多处改动。因为有些访问缺乏统计和监控，出问题时也不方便迅速定位。
-
-• 原数据库表结构设计不十分合理，比如转码后视频和原视频分开存储，前者以后者在数据表中的自增ID作为索引。但实际使用中都是使用video_id(32位的uuid)，如果要用一个video_id查出视频相关数据，则需要两次查询。
-
-• 还有个相关的原因是，之前转码使用的celery做任务调度，但是当视频量逐渐上升之后，渐渐不能满足需求了。
-
-为此，我们决定把数据库重新设计。同时将所有访问都收敛到一个新的数据层服务。重构之后长右边的样子。这样就清爽多了。
-<h2 id="怎么做">怎么做</h2>
-
-<ol>
-  <li>
-    DB重构
-
-    此处不表
-  </li>
-  <li>
-    数据服务重构上线
-
-    前面已经提到过了，原服务叫做old_service，重构后的服务叫new_service。
-
-    data_accss服务使用了两层Redis做cache，一层为缓存型，过期时间较短，一层为持久型，过期时间较长。设计的目的是尽量减少打到DB的流量。一个典型的读数据流程如上图所示。这种设计要求第二层缓存容量显著大于第一层容量才能有效利用空间，然而我们的线上环境并没有配置成这样，所以第二层Redis的命中率长期保持在20%以下。
-
-    new_service基本上继承了old_service的结构，区别有三处。
-
-    • 去掉第二层Redis，改用Abase。后者是在线KV数据库，容量足够大，足以容纳一年以上的视频数据。
-
-    • 增加一个MD5Redis，用来存储上传文件的MD5，用作消重。
-
-    • 每当DB有写操作时，都会写入NSQ。上层vod会消费NSQ，写入自己的缓存，用于容灾。
-
-    new_service还需要考虑另外一个问题，如何不着痕迹地替换线上一直运行的old_service？有两个方案可选。
-
-    • 快速上线，直接切换服务，在某个指定时间段内完成。但考虑到我们15k+的qps，以及分散的上游调用，这种方法很难实现。
-
-    • 用较长的一段时间来进行切换，双写双读两个数据库，校验数据准确率达到4个9以上之后进行切换。
-
-    我们很自然地采用了第二种方案，为了不影响视频的正常播放，我们决定先切写，稳定后再切读流量。好怀念做游戏的时候可以停服维护的日子！
-
-    <div class="highlighter-rouge"><pre class="highlight"><code>######################################################################################################
-漫长的线下测试对比过程，保证数据100%match（实际不是100%，因为新库会删掉一些不需要的字段，另加一些字段，这些在对比时忽略）......
-######################################################################################################
-</code></pre>
-    </div>
-
-    是时候把我们的服务部署上线了，注意这一步还没有接入流量。
-
-    这种方案也有需要思考的地方：双读不用说，肯定是先读新库，如果没有再读老库。双写是先写新库还是先写老库呢？我们决定先写新库，因为最终的目的是使用新库，如果写入有错能尽早地暴露问题。The sooner, the better.
-
-    为了保证写入新库数据的正确性，我们需要足够长的时间来进行数据校验。
-
-    为了保证线上数据正确性，必须两个库都写成功才回给客户端返回成功。毫无疑问，这增加了我们服务出错的概率，因此我们需要尽量缩短双写状态持续的时间。可见上述两个要求是相互矛盾的。
-  </li>
-  <li>
-    收敛部分线上流量到new_service
-
-    warning: 前面两步都是离线操作，随时可以删除重来。但是从这一步开始，以后的操作都跟线上环境相关，必须小心谨慎。
-
-    这里的部分流量指的是指那些还没有收敛到old_service服务的写流量。这只占所有流量很小的一部分，即使有影响也比较可控。
-
-    同样也是因为流量较小，我们的对比工作进行得不太顺利。所以我们需要更多的流量。
-  </li>
-  <li>
-    切换转码流量到new_service
-
-    前面提到了，除了用户上传的原始视频之外，转码后的视频数据也是DB写入量的一大来源(事实上因为一个原始视频会转出多个分辨率，转码后视频数据量是原视频的若干倍）。
-
-    转码的全部输入来自于用户上传的数据，只要上传数据不丢，即使转码失败也可以修复。如果上传写入失败，那么这个视频就无法正确放出了。所以我们选择先迁移转码的写流量。
-
-    如何区分上传和转码的流量呢，我们将new_service部署了default和write两个集群，前者用于上传，后者用于转码，在代码中控制。
-  </li>
-  <li>
-    切换上传流量到new_service
-
-    在测试对比将近两周之后，我们认为是时候完全收敛写流量了。请注意，这里要面对一个很严峻的问题：如果切换上传失败，那么用户在这一段时间的数据将会永远消失，没有任何恢复的办法。
-
-    为此，我们作了“周密”的计划： 在23:00以后切换，因为这段时间上传量达到每天的最小值。
-
-    事实证明，这是一个英明的决策，我们大概花了一个通宵的时间来完成这个过程。期间各种trail and error，大致原因是上传也有若干版本，没有完全收敛。具体细节记不太清楚了，这也说明了事后马上记录的意义。
-  </li>
-  <li>
-    数据迁移，读接口校验
-
-    这里我们又到了一个比较轻松的阶段，只需要定期从新库和老库中取出数据对比即可。除此之外，还有一个看起来简单却异常麻烦的工作：导数据。因为服务现在采用双写，所以只需要导入切流量之前的数据即可。
-
-    我们的数据库存储了2015年头条的第一条视频到现在的所有数据，并且每天以百万级别的量（写文章的时候已超过500万）在增加。总共约3亿条（这里单指原始视频，如果加上转码后视频，会再增加一个数量级）。
-
-    同时虽然old_service服务加了两次cache，但是还是有上千的QPS打到后端DB。如何能快速导完数据并且不影响线上流量？多进程+读从库可破之。之所以使用多进程是因为人生苦短，我用Python。
-
-    有一段时间开发机上将近40个100%CPU的Python进程就是我的作品。
-
-    然而导完了只不过完成了一小部分工作，主要工作是不停地对比。比到山无棱，天地合。对比并不是无意义的，每次都能扫出一些不一样的东西。
-
-    这一步的主要问题有：
-
-    • 导数据中断如何恢复？因为每个进程的数据是预先划分好的，所以每个进程用一个文件记录导入进度即可。
-
-    • 脏数据清洗。因为老DB没有加Uniq索引，所以会出现重复数据，同时还会有一些残缺数据，以及无用数据（比如未上传的）。这一步我们去掉了很多很久以前转码未成功的视频以及缺乏各种必要参数（如存储地址）的视频。对于未转码的视频，我们采用了导入后重转码的方案。
-
-    • 如何找到合适的进程数和单次读取DB条数? Trial and error，时刻关注监控。
-  </li>
-  <li>
-    切换到Sharding数据库,导数据again
-
-    在数据还没对比完的时候，我们发现一个问题：按照目前这种增长速度，单个DB很快就不够用了。于是引入了分库，这个库被命名为sharding库。
-
-    所以我们的写流量需要切换到sharding库，然后下掉new_db库。
-
-    自然，切完流量后，导数据流向就变成了从old_db库到Sharding库。
-
-    sharding库是用Mycat作为代理的。关于Mycat，要吐槽的地方实在太多了，此处省略。
-  </li>
-  <li>
-    上游读对比
-
-    OK，到这里终于可以切读流量了。虽然我们之前对比过DB的数据，但是因为cache的关系，我们还需要调用上游服务，比较old_service和new_service服务的输出是否一致。
-
-    这一步由上游的vod完成，服务本身并不需要做什么改动。
-
-    对比过程也出现了很多不一致的情况，除了DB里确实有不一样的情况之外，主要是Redis里面的脏数据导致，处理也很简单，调用服务清理Redis的接口即可。
-  </li>
-  <li>
-    上游所有读流量收敛到vod
-
-    上游对比完成之后，我们就着手切换读流量了。
-
-    首先确保所有读流量都收敛到vod服务——这主要是一些沟通方面的工作。
-
-    事实上这一步放在切完流量之后也行，但是考虑到我们老服务不久之后就会下线，所以还是尽快让上游迁移比较好。
-  </li>
-  <li>
-    上游切换读流量
-
-    终于看到胜利的曙光，这最后一步，看起来也是最胆战心惊的一步。
-
-    然而是用了三天左右的时间缓慢切完的。中间也基本没出任何纰漏。
-
-    原因是上游的vod也作了重构，重构的版本正好读的是new_service服务。虽然我们的idl格式变了，但是上游vod把变化都包含在内了，对外暴露的接口没变。所以此处只需要切换vod两个版本之间的流量比就可以了。至于为什么可以直接切量，因为主要工作都在第8步对比过程完成了。
-
-    那么为什么用了三天呢？因为需要充cache。如果直接全切，DB瞬间就被打挂了。
-  </li>
-  <li>
-    代码重构
-
-    切换完成之后，做了一次代码重构，虽然接口没变，但是因为存cache的数据结构都变了，上线也费了很多精力。同样省略。
-
-    终于，我们的服务变成了想象中的样子。
-    <h2 id="写在最后">写在最后</h2>
-    没想到迁移一个DB竟然花了这么长时间。分享一下自己学到的东西。
-
-    • 花费了太多精力来处理上线过程中各机器代码不一致的问题，如果我们能把微服务做到松耦合高内聚，流程尽量缩短，甚至只有一步（或者说各步骤之间没有依赖），那么无论多少台机器代码不一样，都不会有问题。
-
-    • 服务收敛，不管是维护，还是切流量，都会简单很多。
-
-    • 提前做好方案review，尽量简化流程，the simpler the better. 可以避免大多数问题。
-
-    • 始终为自己的代码负责，尽量保持接口不变。这次迁移若不是vod兜底，又要花费许多时间来改写接入层。
-
-    • 学习优秀代码设计，我们始终在路上。
-  </li>
-</ol>
-</div>
-    </div>
-</div>
-
-<div class="article">
-    <div class="well">
-        <h1 class="none"><a href="/2017/09/07/readingCode.html">我阅读代码的方法 （2017年09月07日）</a></h1>
-        <div class="content">最近阅读了Redis和NSQ的代码，加上前一段时间研究过的CPython，也算是从开源项目中汲取了一些营养。然而好记性不如烂笔头，如果你有看书看到一半翻回去找前文的经验的话，you know what I means.
-在记录代码给我的收获之前，我想先探讨一下阅读代码的方法。
-
-网上有非常多的“如果阅读XX源码”之类的文章，但我认为并不存在一种普适的阅读方法。比如有的人只是想了解Redis里面跳表的实现方式，他就没有必要去关注整个Redis的体系。有的人喜欢自顶向下，由点及面，有的人喜欢自底向上，垒百尺高台。所以我这里记录的只是适用于我自己（或我这一类码农）的方法。
-
-<h2 id="一个好的ide">一个好的IDE</h2>
-工欲善其事，必先利其器。优秀的IDE能帮助你在阅读时节省大量的时间。虽然我一直坚持认为vim是最好的编辑器，但是阅读代码我还是更喜欢使用VSCode。当然，vim插件是必不可少的。
-为什么使用VSCode，请参考百度。
-
-<h2 id="熟悉语言特性">熟悉语言特性</h2>
-不同的语言有不同的编程风格，这会导致不同语言实现同一功能的代码大不相同。这一点常被我忽视，因而花费了大量的时间去研究某一段在该语言很常见的功能。比如在阅读Chronos代码时的依赖注入和mock，以及NSQ代码中随处可见的select-case-default结构。
-
-<h2 id="熟悉产品理解功能模块">熟悉产品，理解功能模块</h2>
-一般来说，阅读代码都是在实际开发中遇到问题，或者有需要参考的模块。如果单纯为了学习而阅读代码，往往找不到要点所在。容易出现的一个问题是，尝试从某一个点切入，却发现牵扯得越来越多，最后像无头苍蝇般找不到清晰的脉络。原因就是对整个产品不了解，不清楚要阅读的代码属于其中的哪一部分，跟别的模块之间有什么关联。
-
-我比较喜欢的一种方式是先找到项目的官方网站，找到documentation部分，阅读其中项目的介绍，设计模型和原理，API介绍。然后本地搭建环境(Docker)，把代码跑起来。最好是自己编译，因为可能会对代码做一些修改，测试某些功能。如果项目有API，最好把这些API都调用一遍，了解每个API的用途和用法。再和设计原理结合起来，就大概知道项目的功能模块划分了。
-
-<h2 id="从整体到局部先大体框架再深入细节">从整体到局部，先大体框架，再深入细节</h2>
-这一点因人而异吧。如果把代码看做是一个三层的树，根节点（第0层）是代码入口，第1层是各模块划分，第2层是各模块具体实现。那么我通常会采取BFS的阅读方式，即先知道代码由哪些模块组成，然后再深入到细枝末节（这样会显得比较从容）。这样的好处是，你有充分的想象空间从脑子里面设想自己的实现方式，对比发现自己的差距。同时也能更加清晰地把握代码的走向。不好的地方就是，需要的buffer比较多，可能会花费比较多的精力在代码的跳转上，落到具体实现代码的时间比较长一些。如果跳过那么多不熟悉的代码让你惴惴不安，那么还是采用DFS吧。
-
-<h2 id="有侧重点勤于思考善于记录">有侧重点，勤于思考，善于记录</h2>
-侧重于你关注的内容，跳过那些乱七八糟的初始化、清理、测试代码（如果你不是专门为了读这个的话）。思考作者为什么要采用这种方式来实现功能。比如Redis里面的压缩表(ziplist)，查找效率根本就比不上hash表。如上所述，如果你理解Redis的设计目的是作为一个内存数据库，那么就应该知道它最最终的是内存使用效率，所以在内存量比较小的时候，适当牺牲时间效率来换取更好的空间效率。每当获得一些新的启示，就把他们记录下来。That’s what i’m trying to learn.
-
-<h2 id="善用搜索引擎">善用搜索引擎</h2>
-遇到看不懂的代码怎么办？求助Google爸爸吧！一般情况下，stackoverflow和CSDN可以助你一臂之力。如果你有好的答案，记得回馈。
-
-最后，感谢伟大的开源！
-
-<a href="./">back</a>
-</div>
-    </div>
-</div>
-
-            
-                <ul class="pagination">
-        <li>
-            <a href="/article/">
-                <span>首页</span>
-            </a>
-        </li>
-        <li>
-        
-            
-            <a href="/article/">
-            
-                <span>&laquo;</span>
-            </a>
-        
-        </li>
-        
-        <li>
-            
-            <span>&raquo;</span>
-            
-        </li>
-        <li>
-            <a href="/article/">
-                <span>末页</span>
-            </a>
-        </li>
-        <li class="disabled">
-            <span>第页 / 共页</span>
-        </li>
-</ul>
-
-            
+<p>接下来两篇文章将会分析diskqueue和channel。</p>
+
+                        <ul class="pager">
+                            
+                            <li class="previous"><a href="/2017/09/08/what-is-nsq.html"><span aria-hidden="true">&larr;</span>上一篇：NSQ是什么</a></li>
+                            
+                            
+                        </ul>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </div>

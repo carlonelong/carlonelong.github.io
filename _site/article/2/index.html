@@ -109,6 +109,20 @@ Guarantees
 比如：为了实现多个消费者读到同样的数据，引入了单个topic下包含多个channel（此channel非go中的chan）的结构；为了保证消息不丢失，引入了diskQueue将数据保存在磁盘上；为了保证消息一定能被消费者完全接受，引入了inFlightQueue；为了实现延时消息，引入了deferedQueue。
 
 阅读别人的代码最好从一个写代码的人的角度来思考：你要了解的这个功能是不是最基础的特性，如果不是，它依赖了哪些特性。就好像你在实现功能的时候先要找到别人提供的API一样。遇到看不懂的代码怎么办？先放在一边，了解了最基础的特性（函数，类之类）之后，再加上Google，一般来说就能很轻松地理解了。
+NSQ的组成
+NSQ由nsqd, nsqlookupd和nsqadmin3个守护进程（生产环境中是多个进程，但都是这3种之一）构成。
+• nsqd is the daemon that receives, queues, and delivers messages to clients.
+• nsqlookupd is the daemon that manages topology information and provides an eventually consistent discovery service.
+• nsqadmin is a web UI to introspect the cluster in realtime (and perform various administrative tasks).
+
+
+nsq是消息收取、存储和分发的主体，在没有其他两个进程的情况下也可以正常运行。
+
+nsqlookupd用来管理nsqd进程的拓扑结构以及服务发现，比如nsqadmin就需要nsqlookupd来找到合适的nsqd进程。
+
+nsqadmin就是用来操作和查看集群信息的UI界面。
+
+事实上我们关注的核心功能都在nsqd中，所以接下来的分析我会先从nsqd开始，在必要的时候引入nsqdlookupd和nsqadmin。
 小结
 所以NSQ是什么呢？NSQ就是一个消息队列，它能保证消息迅速传达，能保证所有消息不会丢失(除非磁盘满了），至少被传递（到消费者）一次，它能保证多个消费者都能读到同样的数据，它没有单点故障，能快速从错误中恢复。还有一点，它的代码足够简单，而且很gopher范。
 </div>
