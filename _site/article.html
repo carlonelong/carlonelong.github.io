@@ -46,7 +46,7 @@
 </ul>
 
 <ul>
-    <li><a href="/category/nsq.html">nsq（2）</a></li>
+    <li><a href="/category/nsq.html">nsq（3）</a></li>
 </ul>
 
 
@@ -57,6 +57,403 @@
         <div class="col-md-8">
             
             
+<div class="article">
+    <div class="well">
+        <h1 class="none"><a href="/2017/10/01/nsq-channel.html">NSQ Channel （2017年10月01日）</a></h1>
+        <div class="content">在<a href="../../09/17/nsq-topic">NSQ Topic</a>一文中提到了，一个topic下面可以注册多个channel，每个channel都有完整的数据拷贝，但是每个channel的单条信息只能被某一个用户接收。现在就来看看channel是如何实现的。
+<h2 id="channel的定义">channel的定义</h2>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">type</span><span class="x"> </span><span class="n">Channel</span><span class="x"> </span><span class="k">struct</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="c">// 64bit atomic vars need to be first for proper alignment on 32bit platforms</span><span class="x">
+	</span><span class="n">requeueCount</span><span class="x"> </span><span class="kt">uint64</span><span class="x">
+	</span><span class="n">messageCount</span><span class="x"> </span><span class="kt">uint64</span><span class="x">
+	</span><span class="n">timeoutCount</span><span class="x"> </span><span class="kt">uint64</span><span class="x">
+
+	</span><span class="n">sync</span><span class="o">.</span><span class="n">RWMutex</span><span class="x">
+
+	</span><span class="n">topicName</span><span class="x"> </span><span class="kt">string</span><span class="x">
+	</span><span class="n">name</span><span class="x">      </span><span class="kt">string</span><span class="x">
+	</span><span class="n">ctx</span><span class="x">       </span><span class="o">*</span><span class="n">context</span><span class="x">
+
+	</span><span class="n">backend</span><span class="x"> </span><span class="n">BackendQueue</span><span class="x">
+
+	</span><span class="n">memoryMsgChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="x">
+	</span><span class="n">exitFlag</span><span class="x">      </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">exitMutex</span><span class="x">     </span><span class="n">sync</span><span class="o">.</span><span class="n">RWMutex</span><span class="x">
+
+	</span><span class="c">// state tracking</span><span class="x">
+	</span><span class="n">clients</span><span class="x">        </span><span class="k">map</span><span class="p">[</span><span class="kt">int64</span><span class="p">]</span><span class="n">Consumer</span><span class="x">
+	</span><span class="n">paused</span><span class="x">         </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">ephemeral</span><span class="x">      </span><span class="kt">bool</span><span class="x">
+	</span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x">
+	</span><span class="n">deleter</span><span class="x">        </span><span class="n">sync</span><span class="o">.</span><span class="n">Once</span><span class="x">
+
+	</span><span class="c">// Stats tracking</span><span class="x">
+	</span><span class="n">e2eProcessingLatencyStream</span><span class="x"> </span><span class="o">*</span><span class="n">quantile</span><span class="o">.</span><span class="n">Quantile</span><span class="x">
+
+	</span><span class="c">// TODO: these can be DRYd up</span><span class="x">
+	</span><span class="n">deferredMessages</span><span class="x"> </span><span class="k">map</span><span class="p">[</span><span class="n">MessageID</span><span class="p">]</span><span class="o">*</span><span class="n">pqueue</span><span class="o">.</span><span class="n">Item</span><span class="x">
+	</span><span class="n">deferredPQ</span><span class="x">       </span><span class="n">pqueue</span><span class="o">.</span><span class="n">PriorityQueue</span><span class="x">
+	</span><span class="n">deferredMutex</span><span class="x">    </span><span class="n">sync</span><span class="o">.</span><span class="n">Mutex</span><span class="x">
+	</span><span class="n">inFlightMessages</span><span class="x"> </span><span class="k">map</span><span class="p">[</span><span class="n">MessageID</span><span class="p">]</span><span class="o">*</span><span class="n">Message</span><span class="x">
+	</span><span class="n">inFlightPQ</span><span class="x">       </span><span class="n">inFlightPqueue</span><span class="x">
+	</span><span class="n">inFlightMutex</span><span class="x">    </span><span class="n">sync</span><span class="o">.</span><span class="n">Mutex</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+除了一些居家必备良药，如topicName，name等之外，channel跟topic一样，也有一个backend的磁盘队列。为什么topic和channel都需要队列呢？想象一下当topic下没有channel和topic下有多个channel的情况下消息都堆积在哪就豁然开朗了。
+
+与topic相似，channel也有一些用来控制生命周期的变量，比如paused, ephemeral, deleteCallback。此外因为channel是直接连接到消费者，所以有一个clients字典来记录这些consumer。
+
+然而这些跟消息分发半毛钱关系都没有，我们重点关注的是最后几个成员：inFlight*和deferred*。顾名思义，前者是正在分发过程中的消息的相关信息，后者则是被延迟发送消息的信息。
+
+接下来来看看整个流程是怎么样的。
+<h2 id="channel消息分发">Channel消息分发</h2>
+<h3 id="consumer注册">Consumer注册</h3>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">AddClient</span><span class="p">(</span><span class="n">clientID</span><span class="x"> </span><span class="kt">int64</span><span class="p">,</span><span class="x"> </span><span class="n">client</span><span class="x"> </span><span class="n">Consumer</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+	</span><span class="k">defer</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">ok</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">clients</span><span class="p">[</span><span class="n">clientID</span><span class="p">]</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">ok</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">clients</span><span class="p">[</span><span class="n">clientID</span><span class="p">]</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">client</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+很简单，就是把新来的client加入到前面的clients中。不过有个问题，就是如果用户注册的channel不存在呢？回头看看topic就知道了，topic会为不存在的channel_name新创建一个channel。
+
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="n">NewChannel</span><span class="p">(</span><span class="n">topicName</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">channelName</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">ctx</span><span class="x"> </span><span class="o">*</span><span class="n">context</span><span class="p">,</span><span class="x">
+	</span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Channel</span><span class="p">))</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="x"> </span><span class="p">{</span><span class="x">
+
+	</span><span class="n">c</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&amp;</span><span class="n">Channel</span><span class="p">{</span><span class="x">
+		</span><span class="n">topicName</span><span class="o">:</span><span class="x">      </span><span class="n">topicName</span><span class="p">,</span><span class="x">
+		</span><span class="n">name</span><span class="o">:</span><span class="x">           </span><span class="n">channelName</span><span class="p">,</span><span class="x">
+		</span><span class="n">memoryMsgChan</span><span class="o">:</span><span class="x">  </span><span class="nb">make</span><span class="p">(</span><span class="k">chan</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">,</span><span class="x"> </span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">MemQueueSize</span><span class="p">),</span><span class="x">
+		</span><span class="n">clients</span><span class="o">:</span><span class="x">        </span><span class="nb">make</span><span class="p">(</span><span class="k">map</span><span class="p">[</span><span class="kt">int64</span><span class="p">]</span><span class="n">Consumer</span><span class="p">),</span><span class="x">
+		</span><span class="n">deleteCallback</span><span class="o">:</span><span class="x"> </span><span class="n">deleteCallback</span><span class="p">,</span><span class="x">
+		</span><span class="n">ctx</span><span class="o">:</span><span class="x">            </span><span class="n">ctx</span><span class="p">,</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">E2EProcessingLatencyPercentiles</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">e2eProcessingLatencyStream</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">quantile</span><span class="o">.</span><span class="n">New</span><span class="p">(</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">E2EProcessingLatencyWindowTime</span><span class="p">,</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">E2EProcessingLatencyPercentiles</span><span class="p">,</span><span class="x">
+		</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">initPQ</span><span class="p">()</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="n">strings</span><span class="o">.</span><span class="n">HasSuffix</span><span class="p">(</span><span class="n">channelName</span><span class="p">,</span><span class="x"> </span><span class="s">"#ephemeral"</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">ephemeral</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">true</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">newDummyBackendQueue</span><span class="p">()</span><span class="x">
+	</span><span class="p">}</span><span class="x"> </span><span class="k">else</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">dqLogf</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="n">level</span><span class="x"> </span><span class="n">diskqueue</span><span class="o">.</span><span class="n">LogLevel</span><span class="p">,</span><span class="x"> </span><span class="n">f</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">args</span><span class="x"> </span><span class="o">...</span><span class="k">interface</span><span class="p">{})</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">opts</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="x">
+			</span><span class="n">lg</span><span class="o">.</span><span class="n">Logf</span><span class="p">(</span><span class="n">opts</span><span class="o">.</span><span class="n">Logger</span><span class="p">,</span><span class="x"> </span><span class="n">opts</span><span class="o">.</span><span class="n">logLevel</span><span class="p">,</span><span class="x"> </span><span class="n">lg</span><span class="o">.</span><span class="n">LogLevel</span><span class="p">(</span><span class="n">level</span><span class="p">),</span><span class="x"> </span><span class="n">f</span><span class="p">,</span><span class="x"> </span><span class="n">args</span><span class="o">...</span><span class="p">)</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="c">// backend names, for uniqueness, automatically include the topic...</span><span class="x">
+		</span><span class="n">backendName</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">getBackendName</span><span class="p">(</span><span class="n">topicName</span><span class="p">,</span><span class="x"> </span><span class="n">channelName</span><span class="p">)</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">diskqueue</span><span class="o">.</span><span class="n">New</span><span class="p">(</span><span class="x">
+			</span><span class="n">backendName</span><span class="p">,</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">DataPath</span><span class="p">,</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">MaxBytesPerFile</span><span class="p">,</span><span class="x">
+			</span><span class="kt">int32</span><span class="p">(</span><span class="n">minValidMsgLength</span><span class="p">),</span><span class="x">
+			</span><span class="kt">int32</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">MaxMsgSize</span><span class="p">)</span><span class="o">+</span><span class="n">minValidMsgLength</span><span class="p">,</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">SyncEvery</span><span class="p">,</span><span class="x">
+			</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">SyncTimeout</span><span class="p">,</span><span class="x">
+			</span><span class="n">dqLogf</span><span class="p">,</span><span class="x">
+		</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">Notify</span><span class="p">(</span><span class="n">c</span><span class="p">)</span><span class="x">
+
+	</span><span class="k">return</span><span class="x"> </span><span class="n">c</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+类似于topic，channel也会根据是否ephemeral来指定对应的backend。
+
+值得注意的是，NSQ在初始化channel的时候也初始化了前面提到的inFlight<em>和deferred</em>变量。
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">initPQ</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">pqSize</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="kt">int</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">Max</span><span class="p">(</span><span class="m">1</span><span class="p">,</span><span class="x"> </span><span class="kt">float64</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">getOpts</span><span class="p">()</span><span class="o">.</span><span class="n">MemQueueSize</span><span class="p">)</span><span class="o">/</span><span class="m">10</span><span class="p">))</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMessages</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="nb">make</span><span class="p">(</span><span class="k">map</span><span class="p">[</span><span class="n">MessageID</span><span class="p">]</span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMessages</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="nb">make</span><span class="p">(</span><span class="k">map</span><span class="p">[</span><span class="n">MessageID</span><span class="p">]</span><span class="o">*</span><span class="n">pqueue</span><span class="o">.</span><span class="n">Item</span><span class="p">)</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightPQ</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">newInFlightPqueue</span><span class="p">(</span><span class="n">pqSize</span><span class="p">)</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredPQ</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">pqueue</span><span class="o">.</span><span class="n">New</span><span class="p">(</span><span class="n">pqSize</span><span class="p">)</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+代码很清晰，但有两个问题：
+<ol>
+  <li>为什么需要两个变量<em>Messages和</em>PQ呢？</li>
+  <li>为什么inFlightPQ和deferredPQ使用了不一样的数据结构，区别是什么？</li>
+</ol>
+
+我们接着往下面看。
+<h3 id="分发消息到clients">分发消息到clients</h3>
+还记得topic分发消息的方法（messagePump）吗？当消息到来的时候，会被拷贝分发到每个channel。如果消息不需要延迟发送，就调用PutMessage函数，否则调用PutMessageDeferred函数。
+
+<h4 id="即时消息的转发">即时消息的转发</h4>
+根据前面的分析我们大致能猜到，PutMessage操作inFlightMessages。跟踪一下PutMessage的代码：
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">PutMessage</span><span class="p">(</span><span class="n">m</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
+	</span><span class="k">defer</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">RUnlock</span><span class="p">()</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">Exiting</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">errors</span><span class="o">.</span><span class="n">New</span><span class="p">(</span><span class="s">"exiting"</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">m</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">atomic</span><span class="o">.</span><span class="n">AddUint64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">.</span><span class="n">messageCount</span><span class="p">,</span><span class="x"> </span><span class="m">1</span><span class="p">)</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">put</span><span class="p">(</span><span class="n">m</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">select</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">case</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="x"> </span><span class="o">&lt;-</span><span class="x"> </span><span class="n">m</span><span class="o">:</span><span class="x">
+	</span><span class="k">default</span><span class="o">:</span><span class="x">
+		</span><span class="n">b</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">bufferPoolGet</span><span class="p">()</span><span class="x">
+		</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">writeMessageToBackend</span><span class="p">(</span><span class="n">b</span><span class="p">,</span><span class="x"> </span><span class="n">m</span><span class="p">,</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="p">)</span><span class="x">
+		</span><span class="n">bufferPoolPut</span><span class="p">(</span><span class="n">b</span><span class="p">)</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">SetHealth</span><span class="p">(</span><span class="n">err</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"CHANNEL(%s): failed to write message to backend - %s"</span><span class="p">,</span><span class="x">
+				</span><span class="n">c</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+			</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+这部分跟topic分发消息几乎一样，但是消息写入memoryMsgChan之后就不知去向了。通过全局搜索可以发现在protocol_v2.go里面有跟topic又几乎一致的messagePump函数：
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="c">//代码很长，只列出处理消息的部分</span><span class="x">
+</span><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">p</span><span class="x"> </span><span class="o">*</span><span class="n">protocolV2</span><span class="p">)</span><span class="x"> </span><span class="n">messagePump</span><span class="p">(</span><span class="n">client</span><span class="x"> </span><span class="o">*</span><span class="n">clientV2</span><span class="p">,</span><span class="x"> </span><span class="n">startedChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="kt">bool</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="c">//......</span><span class="x">
+	</span><span class="k">for</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">select</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="n">b</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">backendMsgChan</span><span class="o">:</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">sampleRate</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="o">&amp;&amp;</span><span class="x"> </span><span class="n">rand</span><span class="o">.</span><span class="n">Int31n</span><span class="p">(</span><span class="m">100</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="n">sampleRate</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="k">continue</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+
+			</span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">decodeMessage</span><span class="p">(</span><span class="n">b</span><span class="p">)</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="n">p</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"failed to decode message - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+				</span><span class="k">continue</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">msg</span><span class="o">.</span><span class="n">Attempts</span><span class="o">++</span><span class="x">
+
+			</span><span class="n">subChannel</span><span class="o">.</span><span class="n">StartInFlightTimeout</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">client</span><span class="o">.</span><span class="n">ID</span><span class="p">,</span><span class="x"> </span><span class="n">msgTimeout</span><span class="p">)</span><span class="x">
+			</span><span class="n">client</span><span class="o">.</span><span class="n">SendingMessage</span><span class="p">()</span><span class="x">
+			</span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">p</span><span class="o">.</span><span class="n">SendMessage</span><span class="p">(</span><span class="n">client</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="o">&amp;</span><span class="n">buf</span><span class="p">)</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">flushed</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">false</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">memoryMsgChan</span><span class="o">:</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">sampleRate</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="o">&amp;&amp;</span><span class="x"> </span><span class="n">rand</span><span class="o">.</span><span class="n">Int31n</span><span class="p">(</span><span class="m">100</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="n">sampleRate</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="k">continue</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">msg</span><span class="o">.</span><span class="n">Attempts</span><span class="o">++</span><span class="x">
+
+			</span><span class="n">subChannel</span><span class="o">.</span><span class="n">StartInFlightTimeout</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">client</span><span class="o">.</span><span class="n">ID</span><span class="p">,</span><span class="x"> </span><span class="n">msgTimeout</span><span class="p">)</span><span class="x">
+			</span><span class="n">client</span><span class="o">.</span><span class="n">SendingMessage</span><span class="p">()</span><span class="x">
+			</span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">p</span><span class="o">.</span><span class="n">SendMessage</span><span class="p">(</span><span class="n">client</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="o">&amp;</span><span class="n">buf</span><span class="p">)</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">flushed</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">false</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">client</span><span class="o">.</span><span class="n">ExitChan</span><span class="o">:</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+可见，到这一步，无论是memory message还是backend message，都已经发送到client了，但是似乎并未用到inFlightMessages和inFlightPQ。不要着急，看看StartInFlightTimeout：
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">StartInFlightTimeout</span><span class="p">(</span><span class="n">msg</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">,</span><span class="x"> </span><span class="n">clientID</span><span class="x"> </span><span class="kt">int64</span><span class="p">,</span><span class="x"> </span><span class="n">timeout</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Duration</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">now</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Now</span><span class="p">()</span><span class="x">
+	</span><span class="n">msg</span><span class="o">.</span><span class="n">clientID</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">clientID</span><span class="x">
+	</span><span class="n">msg</span><span class="o">.</span><span class="n">deliveryTS</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">now</span><span class="x">
+	</span><span class="n">msg</span><span class="o">.</span><span class="n">pri</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">now</span><span class="o">.</span><span class="n">Add</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span><span class="o">.</span><span class="n">UnixNano</span><span class="p">()</span><span class="x">
+	</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">pushInFlightMessage</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">addToInFlightPQ</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+这里就很清楚了，会把发送到客户端的信息存到inFlightMessages和inFlightPQ。为什么？还记得NSQ的GUARANTEE-“messages are delivered at least once”么？没错，这是为了解决发送失败的问题。当一条消息被发送给client之后，如果在指定时间内仍没有收到客户端的响应的话，NSQ会把本次发送当做失败处理，然后把消息重新放回队列让别的用户有机会读到。
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">processInFlightQueue</span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="kt">int64</span><span class="p">)</span><span class="x"> </span><span class="kt">bool</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">exitMutex</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
+	</span><span class="k">defer</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">exitMutex</span><span class="o">.</span><span class="n">RUnlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">Exiting</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="no">false</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">dirty</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="no">false</span><span class="x">
+	</span><span class="k">for</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+		</span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">_</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">inFlightPQ</span><span class="o">.</span><span class="n">PeekAndShift</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+		</span><span class="k">if</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="n">dirty</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">true</span><span class="x">
+
+		</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">popInFlightMessage</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">clientID</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="o">.</span><span class="n">ID</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="n">atomic</span><span class="o">.</span><span class="n">AddUint64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">.</span><span class="n">timeoutCount</span><span class="p">,</span><span class="x"> </span><span class="m">1</span><span class="p">)</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
+		</span><span class="n">client</span><span class="p">,</span><span class="x"> </span><span class="n">ok</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">clients</span><span class="p">[</span><span class="n">msg</span><span class="o">.</span><span class="n">clientID</span><span class="p">]</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">RUnlock</span><span class="p">()</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">ok</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">client</span><span class="o">.</span><span class="n">TimedOutMessage</span><span class="p">()</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+</span><span class="n">exit</span><span class="o">:</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="n">dirty</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+除此之外，client的一些请求，如FINISH、REQ、TOUCH等指令都会导致inFlightMessages和inFlightPQ的变化（删除或重排）。
+到这里，可以解释为什么用使用PQ和map两种数据结构来保存message了：前者用时间为序，保存时间和message的对应关系，每次取最快要过期的消息，保证遍历能停在第一条未过期的消息处，减少不必要操作，提高效率；后者保存messageID和message对应关系，保证client操作（总是传入messageID）能在O(1)时间内找到message本身。
+
+同样这也是为什么消息不保证顺序的一个重要原因。
+
+还有几个小细节值得思考的：
+<ol>
+  <li>timeout时间是client设置的，因为每个client处于不一样的环境，所以这个选项留给了client自己配置。如果发现超时时间到了，消息还没处理完，有两个解决办法，TOUCH和设置更长的timeout。</li>
+  <li>同一channel下每个用户收到的message是各不一样的，分配的过程就是go里面多个consumer listen同一个chan的过程。每个client可以设置一个sampleRate来决定有多大可能性接收发来的消息。</li>
+  <li>每条消息会记录一个Attempt值，表示发送的次数。client可以根据这个值做一些处理，比如发送10次强制标记为完成。 NSQ是不会主动删除消息的。</li>
+</ol>
+
+<h4 id="延时消息的转发">延时消息的转发</h4>
+前面已经大致描述了即时消息的转发流程，延时消息这里就简略一点。直接上代码。
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">PutMessageDeferred</span><span class="p">(</span><span class="n">msg</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">,</span><span class="x"> </span><span class="n">timeout</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Duration</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">atomic</span><span class="o">.</span><span class="n">AddUint64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">c</span><span class="o">.</span><span class="n">messageCount</span><span class="p">,</span><span class="x"> </span><span class="m">1</span><span class="p">)</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">StartDeferredTimeout</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">timeout</span><span class="p">)</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">StartDeferredTimeout</span><span class="p">(</span><span class="n">msg</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">,</span><span class="x"> </span><span class="n">timeout</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Duration</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">absTs</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Now</span><span class="p">()</span><span class="o">.</span><span class="n">Add</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span><span class="o">.</span><span class="n">UnixNano</span><span class="p">()</span><span class="x">
+	</span><span class="n">item</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&amp;</span><span class="n">pqueue</span><span class="o">.</span><span class="n">Item</span><span class="p">{</span><span class="n">Value</span><span class="o">:</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">Priority</span><span class="o">:</span><span class="x"> </span><span class="n">absTs</span><span class="p">}</span><span class="x">
+	</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">pushDeferredMessage</span><span class="p">(</span><span class="n">item</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">addToDeferredPQ</span><span class="p">(</span><span class="n">item</span><span class="p">)</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">processDeferredQueue</span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="kt">int64</span><span class="p">)</span><span class="x"> </span><span class="kt">bool</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">exitMutex</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
+	</span><span class="k">defer</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">exitMutex</span><span class="o">.</span><span class="n">RUnlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">Exiting</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="no">false</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">dirty</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="no">false</span><span class="x">
+	</span><span class="k">for</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+		</span><span class="n">item</span><span class="p">,</span><span class="x"> </span><span class="n">_</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">deferredPQ</span><span class="o">.</span><span class="n">PeekAndShift</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+		</span><span class="k">if</span><span class="x"> </span><span class="n">item</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="n">dirty</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">true</span><span class="x">
+
+		</span><span class="n">msg</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">item</span><span class="o">.</span><span class="n">Value</span><span class="o">.</span><span class="p">(</span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x">
+		</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">popDeferredMessage</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">ID</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+</span><span class="n">exit</span><span class="o">:</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="n">dirty</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+这里就相对简单了，只要把消息存入deferredPQ，时间到了之后取出来，放入inFlightPQ即可。
+那么为何deferredPQ没有使用和inFlightPQ一样的数据结构呢？说实话不是很明白，我的看法是，因为NSQ主要消耗资源是内存，inFlight message比deferred message存的数据较多，所以要区分开，尽量减小内存占用。但是一般情况下deferred message不会太多吧？
+<h3 id="消息清理">消息清理</h3>
+某些情况下，channel关闭，需要处理剩下的消息，除非删除channel，否则都会会写到磁盘。
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">c</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="p">)</span><span class="x"> </span><span class="n">flush</span><span class="p">()</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">msgBuf</span><span class="x"> </span><span class="n">bytes</span><span class="o">.</span><span class="n">Buffer</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="o">||</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMessages</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="o">||</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMessages</span><span class="p">)</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_INFO</span><span class="p">,</span><span class="x"> </span><span class="s">"CHANNEL(%s): flushing %d memory %d in-flight %d deferred messages to backend"</span><span class="p">,</span><span class="x">
+			</span><span class="n">c</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="p">),</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMessages</span><span class="p">),</span><span class="x"> </span><span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMessages</span><span class="p">))</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="k">for</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">select</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">c</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="o">:</span><span class="x">
+			</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">writeMessageToBackend</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msgBuf</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="p">)</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"failed to write message to backend - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+		</span><span class="k">default</span><span class="o">:</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">finish</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+</span><span class="n">finish</span><span class="o">:</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+	</span><span class="k">for</span><span class="x"> </span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="k">range</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMessages</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">writeMessageToBackend</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msgBuf</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"failed to write message to backend - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">inFlightMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
+	</span><span class="k">for</span><span class="x"> </span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">item</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="k">range</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">deferredMessages</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">msg</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">item</span><span class="o">.</span><span class="n">Value</span><span class="o">.</span><span class="p">(</span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x">
+		</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">writeMessageToBackend</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msgBuf</span><span class="p">,</span><span class="x"> </span><span class="n">msg</span><span class="p">,</span><span class="x"> </span><span class="n">c</span><span class="o">.</span><span class="n">backend</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">c</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"failed to write message to backend - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">c</span><span class="o">.</span><span class="n">deferredMutex</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
+
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+代码比较简单，就不赘述了。
+<h2 id="小结">小结</h2>
+本文<strong>详细</strong>描述了NSQ的channel，大致总结成以下几点
+<ol>
+  <li>channel的每一条消息至少发送一次，至多发送给一个consumer。</li>
+  <li>channel的消息是无序的。</li>
+  <li>NSQ使用priority queue和map来提高查找和使用消息的效率，但是可能会有潜在冗余和一致性问题。</li>
+  <li>client可以通过设置timeout、sampleRate、maxAttemptCount等参数来过滤接收到的消息。</li>
+  <li>写文章好累。</li>
+</ol>
+</div>
+    </div>
+</div>
+
 <div class="article">
     <div class="well">
         <h1 class="none"><a href="/2017/09/17/nsq-topic.html">NSQ Topic （2017年09月17日）</a></h1>
@@ -92,32 +489,32 @@
 带着这些问题，我们进入代码的世界。
 <h2 id="topic">topic</h2>
 topic的代码很好找，在nsqd/topic.go里面。首先看看topic的定义：
-<div class="highlighter-rouge"><pre class="highlight"><code>type Topic struct {
-	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messageCount uint64
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">type</span><span class="x"> </span><span class="n">Topic</span><span class="x"> </span><span class="k">struct</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="c">// 64bit atomic vars need to be first for proper alignment on 32bit platforms</span><span class="x">
+	</span><span class="n">messageCount</span><span class="x"> </span><span class="kt">uint64</span><span class="x">
 
-	sync.RWMutex
+	</span><span class="n">sync</span><span class="o">.</span><span class="n">RWMutex</span><span class="x">
 
-	name              string
-	channelMap        map[string]*Channel
-	backend           BackendQueue
-	memoryMsgChan     chan *Message
-	exitChan          chan int
-	channelUpdateChan chan int
-	waitGroup         util.WaitGroupWrapper
-	exitFlag          int32
-	idFactory         *guidFactory
+	</span><span class="n">name</span><span class="x">              </span><span class="kt">string</span><span class="x">
+	</span><span class="n">channelMap</span><span class="x">        </span><span class="k">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="o">*</span><span class="n">Channel</span><span class="x">
+	</span><span class="n">backend</span><span class="x">           </span><span class="n">BackendQueue</span><span class="x">
+	</span><span class="n">memoryMsgChan</span><span class="x">     </span><span class="k">chan</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="x">
+	</span><span class="n">exitChan</span><span class="x">          </span><span class="k">chan</span><span class="x"> </span><span class="kt">int</span><span class="x">
+	</span><span class="n">channelUpdateChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="kt">int</span><span class="x">
+	</span><span class="n">waitGroup</span><span class="x">         </span><span class="n">util</span><span class="o">.</span><span class="n">WaitGroupWrapper</span><span class="x">
+	</span><span class="n">exitFlag</span><span class="x">          </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">idFactory</span><span class="x">         </span><span class="o">*</span><span class="n">guidFactory</span><span class="x">
 
-	ephemeral      bool
-	deleteCallback func(*Topic)
-	deleter        sync.Once
+	</span><span class="n">ephemeral</span><span class="x">      </span><span class="kt">bool</span><span class="x">
+	</span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x">
+	</span><span class="n">deleter</span><span class="x">        </span><span class="n">sync</span><span class="o">.</span><span class="n">Once</span><span class="x">
 
-	paused    int32
-	pauseChan chan bool
+	</span><span class="n">paused</span><span class="x">    </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">pauseChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="kt">bool</span><span class="x">
 
-	ctx *context
-}
-</code></pre>
+	</span><span class="n">ctx</span><span class="x"> </span><span class="o">*</span><span class="n">context</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
 </div>
 不妨先根据字面意思和之前的分析来猜测一下，Topic里面各个字段的含义。
 messageCount毫无疑问是消息的条数；name是topic的名字；channelMap是用来存储不同channel的；sync.RWMutex是读写锁，猜测是控制多个channel的同步用的……
@@ -126,8 +523,7 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 
 那么从topic的生命周期来寻找答案吧。
 <h3 id="create-topic">create topic</h3>
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="n">NewTopic</span><span class="p">(</span><span class="n">topicName</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">ctx</span><span class="x"> </span><span class="o">*</span><span class="n">context</span><span class="p">,</span><span class="x"> </span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Topic</span><span class="p">))</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="n">NewTopic</span><span class="p">(</span><span class="n">topicName</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">ctx</span><span class="x"> </span><span class="o">*</span><span class="n">context</span><span class="p">,</span><span class="x"> </span><span class="n">deleteCallback</span><span class="x"> </span><span class="k">func</span><span class="p">(</span><span class="o">*</span><span class="n">Topic</span><span class="p">))</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">t</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&amp;</span><span class="n">Topic</span><span class="p">{</span><span class="x">
 		</span><span class="n">name</span><span class="o">:</span><span class="x">              </span><span class="n">topicName</span><span class="p">,</span><span class="x">
 		</span><span class="n">channelMap</span><span class="o">:</span><span class="x">        </span><span class="nb">make</span><span class="p">(</span><span class="k">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="o">*</span><span class="n">Channel</span><span class="p">),</span><span class="x">
@@ -165,28 +561,28 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 	</span><span class="n">t</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">Notify</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="x">
 
 	</span><span class="k">return</span><span class="x"> </span><span class="n">t</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 好吧，搞了半天也没搞定代码显示行号的问题。。。。。。
 
 关注第14行，这里有对ephemeral的判断，如果topicName有这个后缀，那么backend就是假的，否则就会起一个diskqueue来做backend。从diskqueue的名字猜测，这是一个存储在磁盘上的队列。因此我们之前的猜测大体是正确的：topic的消息太多时，会存在磁盘里面。对这个diskqueue的分析，我们以后再做。
 
 再看一个有意思的用法
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">w</span><span class="x"> </span><span class="o">*</span><span class="n">WaitGroupWrapper</span><span class="p">)</span><span class="x"> </span><span class="n">Wrap</span><span class="p">(</span><span class="n">cb</span><span class="x"> </span><span class="k">func</span><span class="p">())</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">w</span><span class="x"> </span><span class="o">*</span><span class="n">WaitGroupWrapper</span><span class="p">)</span><span class="x"> </span><span class="n">Wrap</span><span class="p">(</span><span class="n">cb</span><span class="x"> </span><span class="k">func</span><span class="p">())</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">w</span><span class="o">.</span><span class="n">Add</span><span class="p">(</span><span class="m">1</span><span class="p">)</span><span class="x">
 	</span><span class="k">go</span><span class="x"> </span><span class="k">func</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
 		</span><span class="n">cb</span><span class="p">()</span><span class="x">
 		</span><span class="n">w</span><span class="o">.</span><span class="n">Done</span><span class="p">()</span><span class="x">
 	</span><span class="p">}()</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 这是waitGroup的Wrap操作，把cb封装起来。注意这里没有Wait操作，所以并不会阻塞。那么阻塞在哪里呢？搜代码可以发现，在topic的exit操作中。
 
 也就是说，这个waitGroup的作用是：在退出topic之前，一定要保证cb（这里是messagePump）执行完成。从名字上看，messagePump就是topic不断往各个channel发送消息的过程，这个我们留在后面分析。
 <h3 id="create-channel">create channel</h3>
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">GetChannel</span><span class="p">(</span><span class="n">channelName</span><span class="x"> </span><span class="kt">string</span><span class="p">)</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">GetChannel</span><span class="p">(</span><span class="n">channelName</span><span class="x"> </span><span class="kt">string</span><span class="p">)</span><span class="x"> </span><span class="o">*</span><span class="n">Channel</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">t</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span><span class="x">
 	</span><span class="n">channel</span><span class="p">,</span><span class="x"> </span><span class="n">isNew</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">getOrCreateChannel</span><span class="p">(</span><span class="n">channelName</span><span class="p">)</span><span class="x">
 	</span><span class="n">t</span><span class="o">.</span><span class="n">Unlock</span><span class="p">()</span><span class="x">
@@ -200,13 +596,13 @@ messageCount毫无疑问是消息的条数；name是topic的名字；channelMap�
 	</span><span class="p">}</span><span class="x">
 
 	</span><span class="k">return</span><span class="x"> </span><span class="n">channel</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 代码很清楚：给定一个channel name，如果对应的channel已经存在，就返回，否则创建一个新的。对于topic也有一样的逻辑（在nsqd中）。所以如果没有对topic和name做别的限制，你想怎么用就怎么用。这里的channelUpdateChan是用来告诉messagePump：我又创建了一个channel，下次别忘了把消息发给它。
 <h3 id="接收消息">接收消息</h3>
 topic创建好之后，producer就可以往这个topic下面发消息了。
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">PutMessage</span><span class="p">(</span><span class="n">m</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">PutMessage</span><span class="p">(</span><span class="n">m</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="p">)</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="n">t</span><span class="o">.</span><span class="n">RLock</span><span class="p">()</span><span class="x">
 	</span><span class="k">defer</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">RUnlock</span><span class="p">()</span><span class="x">
 	</span><span class="k">if</span><span class="x"> </span><span class="n">atomic</span><span class="o">.</span><span class="n">LoadInt32</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="o">.</span><span class="n">exitFlag</span><span class="p">)</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="m">1</span><span class="x"> </span><span class="p">{</span><span class="x">
@@ -236,19 +632,19 @@ topic创建好之后，producer就可以往这个topic下面发消息了。
 		</span><span class="p">}</span><span class="x">
 	</span><span class="p">}</span><span class="x">
 	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 这里的逻辑也很简单，消息来到后，尝试往memoryMsgChan里面写。如果阻塞了，就往backend里面写。所以，不需要担心消息写不下，只要磁盘有空间就没问题。那么怎么知道堆积了多少消息呢？
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">Depth</span><span class="p">()</span><span class="x"> </span><span class="kt">int64</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">Depth</span><span class="p">()</span><span class="x"> </span><span class="kt">int64</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="k">return</span><span class="x"> </span><span class="kt">int64</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">memoryMsgChan</span><span class="p">))</span><span class="x"> </span><span class="o">+</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">Depth</span><span class="p">()</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 那么写往memoryMsgChan的消息又哪儿去了呢？很显然，要发送到每个channel去了。怎么发的呢？是的，messagePump！
 <h3 id="消息转发">消息转发</h3>
 终于到消息转发了，激不激动？
-
-<figure class="highlight"><pre><code class="language-go" data-lang="go"><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">messagePump</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">t</span><span class="x"> </span><span class="o">*</span><span class="n">Topic</span><span class="p">)</span><span class="x"> </span><span class="n">messagePump</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
 	</span><span class="k">var</span><span class="x"> </span><span class="n">msg</span><span class="x"> </span><span class="o">*</span><span class="n">Message</span><span class="x">
 	</span><span class="k">var</span><span class="x"> </span><span class="n">buf</span><span class="x"> </span><span class="p">[]</span><span class="kt">byte</span><span class="x">
 	</span><span class="k">var</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="kt">error</span><span class="x">
@@ -330,8 +726,9 @@ topic创建好之后，producer就可以往这个topic下面发消息了。
 
 </span><span class="n">exit</span><span class="o">:</span><span class="x">
 	</span><span class="n">t</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">nsqd</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">LOG_INFO</span><span class="p">,</span><span class="x"> </span><span class="s">"TOPIC(%s): closing ... messagePump"</span><span class="p">,</span><span class="x"> </span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">)</span><span class="x">
-</span><span class="p">}</span></code></pre></figure>
-
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
 在一个比较大的for循环里，messagePump对几类消息做了不同的处理
 <ol>
   <li>memoryMsgChan或者backendChan，表示真实的消息内容，区别在于后者是编码后存入磁盘的，所以需要多一道解码的工序。</li>
