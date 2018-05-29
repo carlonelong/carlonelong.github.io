@@ -385,6 +385,5 @@ finish:
 本文**详细**描述了NSQ的channel，大致总结成以下几点
 1. channel的每一条消息至少发送一次，至多发送给一个consumer。
 2. channel的消息是无序的。
-3. NSQ使用priority queue和map来提高查找和使用消息的效率，但是可能会有潜在冗余和一致性问题。
-4. client可以通过设置timeout、sampleRate、maxAttemptCount等参数来过滤接收到的消息。
-5. 写文章好累。
+3. client可以通过设置timeout、sampleRate、maxAttemptCount等参数来过滤接收到的消息。
+4. 写文章好累。

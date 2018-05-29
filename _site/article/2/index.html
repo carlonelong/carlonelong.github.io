@@ -46,7 +46,7 @@
 </ul>
 
 <ul>
-    <li><a href="/category/nsq.html">nsq（3）</a></li>
+    <li><a href="/category/nsq.html">nsq（4）</a></li>
 </ul>
 
 
@@ -59,96 +59,102 @@
             
 <div class="article">
     <div class="well">
-        <h1 class="none"><a href="/2017/09/17/nsq-topic.html">NSQ Topic （2017年09月17日）</a></h1>
-        <div class="content">第一篇文章提到了，本着从简单到复杂的原则，我们会从nsqd开始对NSQ进行分析。
-nsqd组成
-先从官网上偷一张示意图
-
-
-
-从图中可以看出
-
-  一个topic下对应多个channel
-  一个channel下对应多个consumer
-  每个channel都会获得所有消息
-  单个channel下的消息只会被一个consumer获得
-  如果一个channel的消息一直不被消费，会一直堆积
-
-
-我们可以得出以下几点推论：
-
-  如果两个消费者都想要获得全部消息，那么他们必须在独立的channel下。比如硬盘备份和打印metrics。
-  即使consumer在channel创建之后才注册，在堆积不超过nsqd前提下，仍然能获取到所有消息。
-
-
-同样也会有疑问，比如：
-
-  每个channel的堆积上限是多少？超过上限之后处理逻辑是什么？
-  多个consumer消费同一个channel采用什么样的分配策略，是否公平？
-  从topic到多个channel，从channel到多个consumer，如何保证消息不会丢失？
-  如何保证同一channel下一条消息不会发送到多个consumer?
-
-
-带着这些问题，我们进入代码的世界。
-topic
-topic的代码很好找，在nsqd/topic.go里面。首先看看topic的定义：
-type Topic struct {
+        <h1 class="none"><a href="/2017/10/01/nsq-channel.html">NSQ Channel （2017年10月01日）</a></h1>
+        <div class="content">在NSQ Topic一文中提到了，一个topic下面可以注册多个channel，每个channel都有完整的数据拷贝，但是每个channel的单条信息只能被某一个用户接收。现在就来看看channel是如何实现的。
+channel的定义
+type Channel struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	requeueCount uint64
 	messageCount uint64
+	timeoutCount uint64
 
 	sync.RWMutex
 
-	name              string
-	channelMap        map[string]*Channel
-	backend           BackendQueue
-	memoryMsgChan     chan *Message
-	exitChan          chan int
-	channelUpdateChan chan int
-	waitGroup         util.WaitGroupWrapper
-	exitFlag          int32
-	idFactory         *guidFactory
+	topicName string
+	name      string
+	ctx       *context
 
+	backend BackendQueue
+
+	memoryMsgChan chan *Message
+	exitFlag      int32
+	exitMutex     sync.RWMutex
+
+	// state tracking
+	clients        map[int64]Consumer
+	paused         int32
 	ephemeral      bool
-	deleteCallback func(*Topic)
+	deleteCallback func(*Channel)
 	deleter        sync.Once
 
-	paused    int32
-	pauseChan chan bool
+	// Stats tracking
+	e2eProcessingLatencyStream *quantile.Quantile
 
-	ctx *context
+	// TODO: these can be DRYd up
+	deferredMessages map[MessageID]*pqueue.Item
+	deferredPQ       pqueue.PriorityQueue
+	deferredMutex    sync.Mutex
+	inFlightMessages map[MessageID]*Message
+	inFlightPQ       inFlightPqueue
+	inFlightMutex    sync.Mutex
 }
 
 
-不妨先根据字面意思和之前的分析来猜测一下，Topic里面各个字段的含义。
-messageCount毫无疑问是消息的条数；name是topic的名字；channelMap是用来存储不同channel的；sync.RWMutex是读写锁，猜测是控制多个channel的同步用的……
+除了一些居家必备良药，如topicName，name等之外，channel跟topic一样，也有一个backend的磁盘队列。为什么topic和channel都需要队列呢？想象一下当topic下没有channel和topic下有多个channel的情况下消息都堆积在哪就豁然开朗了。
 
-几个chan的含义都比较明显，比较奇怪的是backend这个字段，看起来略显突兀，似乎和队列的堆积有些关系。ephemeral用来标志topic是临时有效的，不知道会有怎么样的处理呢？
+与topic相似，channel也有一些用来控制生命周期的变量，比如paused, ephemeral, deleteCallback。此外因为channel是直接连接到消费者，所以有一个clients字典来记录这些consumer。
 
-那么从topic的生命周期来寻找答案吧。
-create topic
-func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topic {
-	t := &amp;Topic{
-		name:              topicName,
-		channelMap:        make(map[string]*Channel),
-		memoryMsgChan:     make(chan *Message, ctx.nsqd.getOpts().MemQueueSize),
-		exitChan:          make(chan int),
-		channelUpdateChan: make(chan int),
-		ctx:               ctx,
-		pauseChan:         make(chan bool),
-		deleteCallback:    deleteCallback,
-		idFactory:         NewGUIDFactory(ctx.nsqd.getOpts().ID),
+然而这些跟消息分发半毛钱关系都没有，我们重点关注的是最后几个成员：inFlight*和deferred*。顾名思义，前者是正在分发过程中的消息的相关信息，后者则是被延迟发送消息的信息。
+
+接下来来看看整个流程是怎么样的。
+Channel消息分发
+Consumer注册
+func (c *Channel) AddClient(clientID int64, client Consumer) {
+	c.Lock()
+	defer c.Unlock()
+
+	_, ok := c.clients[clientID]
+	if ok {
+		return
+	}
+	c.clients[clientID] = client
+}
+
+
+很简单，就是把新来的client加入到前面的clients中。不过有个问题，就是如果用户注册的channel不存在呢？回头看看topic就知道了，topic会为不存在的channel_name新创建一个channel。
+
+func NewChannel(topicName string, channelName string, ctx *context,
+	deleteCallback func(*Channel)) *Channel {
+
+	c := &amp;Channel{
+		topicName:      topicName,
+		name:           channelName,
+		memoryMsgChan:  make(chan *Message, ctx.nsqd.getOpts().MemQueueSize),
+		clients:        make(map[int64]Consumer),
+		deleteCallback: deleteCallback,
+		ctx:            ctx,
+	}
+	if len(ctx.nsqd.getOpts().E2EProcessingLatencyPercentiles) &gt; 0 {
+		c.e2eProcessingLatencyStream = quantile.New(
+			ctx.nsqd.getOpts().E2EProcessingLatencyWindowTime,
+			ctx.nsqd.getOpts().E2EProcessingLatencyPercentiles,
+		)
 	}
 
-	if strings.HasSuffix(topicName, "#ephemeral") {
-		t.ephemeral = true
-		t.backend = newDummyBackendQueue()
+	c.initPQ()
+
+	if strings.HasSuffix(channelName, "#ephemeral") {
+		c.ephemeral = true
+		c.backend = newDummyBackendQueue()
 	} else {
 		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
 			opts := ctx.nsqd.getOpts()
 			lg.Logf(opts.Logger, opts.logLevel, lg.LogLevel(level), f, args...)
 		}
-		t.backend = diskqueue.New(
-			topicName,
+		// backend names, for uniqueness, automatically include the topic...
+		backendName := getBackendName(topicName, channelName)
+		c.backend = diskqueue.New(
+			backendName,
 			ctx.nsqd.getOpts().DataPath,
 			ctx.nsqd.getOpts().MaxBytesPerFile,
 			int32(minValidMsgLength),
@@ -159,78 +165,67 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		)
 	}
 
-	t.waitGroup.Wrap(func() { t.messagePump() })
+	c.ctx.nsqd.Notify(c)
 
-	t.ctx.nsqd.Notify(t)
-
-	return t
+	return c
 }
 
 
-好吧，搞了半天也没搞定代码显示行号的问题。。。。。。
+类似于topic，channel也会根据是否ephemeral来指定对应的backend。
 
-关注第14行，这里有对ephemeral的判断，如果topicName有这个后缀，那么backend就是假的，否则就会起一个diskqueue来做backend。从diskqueue的名字猜测，这是一个存储在磁盘上的队列。因此我们之前的猜测大体是正确的：topic的消息太多时，会存在磁盘里面。对这个diskqueue的分析，我们以后再做。
+值得注意的是，NSQ在初始化channel的时候也初始化了前面提到的inFlight和deferred变量。
+func (c *Channel) initPQ() {
+	pqSize := int(math.Max(1, float64(c.ctx.nsqd.getOpts().MemQueueSize)/10))
 
-再看一个有意思的用法
-func (w *WaitGroupWrapper) Wrap(cb func()) {
-	w.Add(1)
-	go func() {
-		cb()
-		w.Done()
-	}()
+	c.inFlightMessages = make(map[MessageID]*Message)
+	c.deferredMessages = make(map[MessageID]*pqueue.Item)
+
+	c.inFlightMutex.Lock()
+	c.inFlightPQ = newInFlightPqueue(pqSize)
+	c.inFlightMutex.Unlock()
+
+	c.deferredMutex.Lock()
+	c.deferredPQ = pqueue.New(pqSize)
+	c.deferredMutex.Unlock()
 }
 
 
-这是waitGroup的Wrap操作，把cb封装起来。注意这里没有Wait操作，所以并不会阻塞。那么阻塞在哪里呢？搜代码可以发现，在topic的exit操作中。
+代码很清晰，但有两个问题：
 
-也就是说，这个waitGroup的作用是：在退出topic之前，一定要保证cb（这里是messagePump）执行完成。从名字上看，messagePump就是topic不断往各个channel发送消息的过程，这个我们留在后面分析。
-create channel
-func (t *Topic) GetChannel(channelName string) *Channel {
-	t.Lock()
-	channel, isNew := t.getOrCreateChannel(channelName)
-	t.Unlock()
-
-	if isNew {
-		// update messagePump state
-		select {
-		case t.channelUpdateChan &lt;- 1:
-		case &lt;-t.exitChan:
-		}
-	}
-
-	return channel
-}
+  为什么需要两个变量Messages和PQ呢？
+  为什么inFlightPQ和deferredPQ使用了不一样的数据结构，区别是什么？
 
 
-代码很清楚：给定一个channel name，如果对应的channel已经存在，就返回，否则创建一个新的。对于topic也有一样的逻辑（在nsqd中）。所以如果没有对topic和name做别的限制，你想怎么用就怎么用。这里的channelUpdateChan是用来告诉messagePump：我又创建了一个channel，下次别忘了把消息发给它。
-接收消息
-topic创建好之后，producer就可以往这个topic下面发消息了。
-func (t *Topic) PutMessage(m *Message) error {
-	t.RLock()
-	defer t.RUnlock()
-	if atomic.LoadInt32(&amp;t.exitFlag) == 1 {
+我们接着往下面看。
+分发消息到clients
+还记得topic分发消息的方法（messagePump）吗？当消息到来的时候，会被拷贝分发到每个channel。如果消息不需要延迟发送，就调用PutMessage函数，否则调用PutMessageDeferred函数。
+
+即时消息的转发
+根据前面的分析我们大致能猜到，PutMessage操作inFlightMessages。跟踪一下PutMessage的代码：
+func (c *Channel) PutMessage(m *Message) error {
+	c.RLock()
+	defer c.RUnlock()
+	if c.Exiting() {
 		return errors.New("exiting")
 	}
-	err := t.put(m)
+	err := c.put(m)
 	if err != nil {
 		return err
 	}
-	atomic.AddUint64(&amp;t.messageCount, 1)
+	atomic.AddUint64(&amp;c.messageCount, 1)
 	return nil
 }
-
-func (t *Topic) put(m *Message) error {
+func (c *Channel) put(m *Message) error {
 	select {
-	case t.memoryMsgChan &lt;- m:
+	case c.memoryMsgChan &lt;- m:
 	default:
 		b := bufferPoolGet()
-		err := writeMessageToBackend(b, m, t.backend)
+		err := writeMessageToBackend(b, m, c.backend)
 		bufferPoolPut(b)
-		t.ctx.nsqd.SetHealth(err)
+		c.ctx.nsqd.SetHealth(err)
 		if err != nil {
-			t.ctx.nsqd.logf(LOG_ERROR,
-				"TOPIC(%s) ERROR: failed to write message to backend - %s",
-				t.name, err)
+			c.ctx.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to write message to backend - %s",
+				c.name, err)
 			return err
 		}
 	}
@@ -238,138 +233,222 @@ func (t *Topic) put(m *Message) error {
 }
 
 
-这里的逻辑也很简单，消息来到后，尝试往memoryMsgChan里面写。如果阻塞了，就往backend里面写。所以，不需要担心消息写不下，只要磁盘有空间就没问题。那么怎么知道堆积了多少消息呢？
-func (t *Topic) Depth() int64 {
-	return int64(len(t.memoryMsgChan)) + t.backend.Depth()
+这部分跟topic分发消息几乎一样，但是消息写入memoryMsgChan之后就不知去向了。通过全局搜索可以发现在protocol_v2.go里面有跟topic又几乎一致的messagePump函数：
+//代码很长，只列出处理消息的部分
+func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
+	//......
+	for {
+		select {
+		case b := &lt;-backendMsgChan:
+			if sampleRate &gt; 0 &amp;&amp; rand.Int31n(100) &gt; sampleRate {
+				continue
+			}
+
+			msg, err := decodeMessage(b)
+			if err != nil {
+				p.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
+				continue
+			}
+			msg.Attempts++
+
+			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
+			client.SendingMessage()
+			err = p.SendMessage(client, msg, &amp;buf)
+			if err != nil {
+				goto exit
+			}
+			flushed = false
+		case msg := &lt;-memoryMsgChan:
+			if sampleRate &gt; 0 &amp;&amp; rand.Int31n(100) &gt; sampleRate {
+				continue
+			}
+			msg.Attempts++
+
+			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
+			client.SendingMessage()
+			err = p.SendMessage(client, msg, &amp;buf)
+			if err != nil {
+				goto exit
+			}
+			flushed = false
+		case &lt;-client.ExitChan:
+			goto exit
+		}
+	}
 }
 
 
-那么写往memoryMsgChan的消息又哪儿去了呢？很显然，要发送到每个channel去了。怎么发的呢？是的，messagePump！
-消息转发
-终于到消息转发了，激不激动？
-func (t *Topic) messagePump() {
-	var msg *Message
-	var buf []byte
-	var err error
-	var chans []*Channel
-	var memoryMsgChan chan *Message
-	var backendChan chan []byte
-
-	t.RLock()
-	for _, c := range t.channelMap {
-		chans = append(chans, c)
+可见，到这一步，无论是memory message还是backend message，都已经发送到client了，但是似乎并未用到inFlightMessages和inFlightPQ。不要着急，看看StartInFlightTimeout：
+func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
+	now := time.Now()
+	msg.clientID = clientID
+	msg.deliveryTS = now
+	msg.pri = now.Add(timeout).UnixNano()
+	err := c.pushInFlightMessage(msg)
+	if err != nil {
+		return err
 	}
-	t.RUnlock()
+	c.addToInFlightPQ(msg)
+	return nil
+}
 
-	if len(chans) &gt; 0 {
-		memoryMsgChan = t.memoryMsgChan
-		backendChan = t.backend.ReadChan()
+
+这里就很清楚了，会把发送到客户端的信息存到inFlightMessages和inFlightPQ。为什么？还记得NSQ的GUARANTEE-“messages are delivered at least once”么？没错，这是为了解决发送失败的问题。当一条消息被发送给client之后，如果在指定时间内仍没有收到客户端的响应的话，NSQ会把本次发送当做失败处理，然后把消息重新放回队列让别的用户有机会读到。
+func (c *Channel) processInFlightQueue(t int64) bool {
+	c.exitMutex.RLock()
+	defer c.exitMutex.RUnlock()
+
+	if c.Exiting() {
+		return false
+	}
+
+	dirty := false
+	for {
+		c.inFlightMutex.Lock()
+		msg, _ := c.inFlightPQ.PeekAndShift(t)
+		c.inFlightMutex.Unlock()
+
+		if msg == nil {
+			goto exit
+		}
+		dirty = true
+
+		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
+		if err != nil {
+			goto exit
+		}
+		atomic.AddUint64(&amp;c.timeoutCount, 1)
+		c.RLock()
+		client, ok := c.clients[msg.clientID]
+		c.RUnlock()
+		if ok {
+			client.TimedOutMessage()
+		}
+		c.put(msg)
+	}
+
+exit:
+	return dirty
+}
+
+
+除此之外，client的一些请求，如FINISH、REQ、TOUCH等指令都会导致inFlightMessages和inFlightPQ的变化（删除或重排）。
+到这里，可以解释为什么用使用PQ和map两种数据结构来保存message了：前者用时间为序，保存时间和message的对应关系，每次取最快要过期的消息，保证遍历能停在第一条未过期的消息处，减少不必要操作，提高效率；后者保存messageID和message对应关系，保证client操作（总是传入messageID）能在O(1)时间内找到message本身。
+
+同样这也是为什么消息不保证顺序的一个重要原因。
+
+还有几个小细节值得思考的：
+
+  timeout时间是client设置的，因为每个client处于不一样的环境，所以这个选项留给了client自己配置。如果发现超时时间到了，消息还没处理完，有两个解决办法，TOUCH和设置更长的timeout。
+  同一channel下每个用户收到的message是各不一样的，分配的过程就是go里面多个consumer listen同一个chan的过程。每个client可以设置一个sampleRate来决定有多大可能性接收发来的消息。
+  每条消息会记录一个Attempt值，表示发送的次数。client可以根据这个值做一些处理，比如发送10次强制标记为完成。 NSQ是不会主动删除消息的。
+
+
+延时消息的转发
+前面已经大致描述了即时消息的转发流程，延时消息这里就简略一点。直接上代码。
+func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
+	atomic.AddUint64(&amp;c.messageCount, 1)
+	c.StartDeferredTimeout(msg, timeout)
+}
+func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
+	absTs := time.Now().Add(timeout).UnixNano()
+	item := &amp;pqueue.Item{Value: msg, Priority: absTs}
+	err := c.pushDeferredMessage(item)
+	if err != nil {
+		return err
+	}
+	c.addToDeferredPQ(item)
+	return nil
+}
+func (c *Channel) processDeferredQueue(t int64) bool {
+	c.exitMutex.RLock()
+	defer c.exitMutex.RUnlock()
+
+	if c.Exiting() {
+		return false
+	}
+
+	dirty := false
+	for {
+		c.deferredMutex.Lock()
+		item, _ := c.deferredPQ.PeekAndShift(t)
+		c.deferredMutex.Unlock()
+
+		if item == nil {
+			goto exit
+		}
+		dirty = true
+
+		msg := item.Value.(*Message)
+		_, err := c.popDeferredMessage(msg.ID)
+		if err != nil {
+			goto exit
+		}
+		c.put(msg)
+	}
+
+exit:
+	return dirty
+}
+
+
+这里就相对简单了，只要把消息存入deferredPQ，时间到了之后取出来，放入inFlightPQ即可。
+那么为何deferredPQ没有使用和inFlightPQ一样的数据结构呢？说实话不是很明白，我的看法是，因为NSQ主要消耗资源是内存，inFlight message比deferred message存的数据较多，所以要区分开，尽量减小内存占用。但是一般情况下deferred message不会太多吧？
+消息清理
+某些情况下，channel关闭，需要处理剩下的消息，除非删除channel，否则都会会写到磁盘。
+func (c *Channel) flush() error {
+	var msgBuf bytes.Buffer
+
+	if len(c.memoryMsgChan) &gt; 0 || len(c.inFlightMessages) &gt; 0 || len(c.deferredMessages) &gt; 0 {
+		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): flushing %d memory %d in-flight %d deferred messages to backend",
+			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferredMessages))
 	}
 
 	for {
 		select {
-		case msg = &lt;-memoryMsgChan:
-		case buf = &lt;-backendChan:
-			msg, err = decodeMessage(buf)
+		case msg := &lt;-c.memoryMsgChan:
+			err := writeMessageToBackend(&amp;msgBuf, msg, c.backend)
 			if err != nil {
-				t.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
-				continue
+				c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
 			}
-		case &lt;-t.channelUpdateChan:
-			chans = chans[:0]
-			t.RLock()
-			for _, c := range t.channelMap {
-				chans = append(chans, c)
-			}
-			t.RUnlock()
-			if len(chans) == 0 || t.IsPaused() {
-				memoryMsgChan = nil
-				backendChan = nil
-			} else {
-				memoryMsgChan = t.memoryMsgChan
-				backendChan = t.backend.ReadChan()
-			}
-			continue
-		case pause := &lt;-t.pauseChan:
-			if pause || len(chans) == 0 {
-				memoryMsgChan = nil
-				backendChan = nil
-			} else {
-				memoryMsgChan = t.memoryMsgChan
-				backendChan = t.backend.ReadChan()
-			}
-			continue
-		case &lt;-t.exitChan:
-			goto exit
-		}
-
-		for i, channel := range chans {
-			chanMsg := msg
-			// copy the message because each channel
-			// needs a unique instance but...
-			// fastpath to avoid copy if its the first channel
-			// (the topic already created the first copy)
-			if i &gt; 0 {
-				chanMsg = NewMessage(msg.ID, msg.Body)
-				chanMsg.Timestamp = msg.Timestamp
-				chanMsg.deferred = msg.deferred
-			}
-			if chanMsg.deferred != 0 {
-				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
-				continue
-			}
-			err := channel.PutMessage(chanMsg)
-			if err != nil {
-				t.ctx.nsqd.logf(LOG_ERROR,
-					"TOPIC(%s) ERROR: failed to put msg(%s) to channel(%s) - %s",
-					t.name, msg.ID, channel.name, err)
-			}
+		default:
+			goto finish
 		}
 	}
 
-exit:
-	t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing ... messagePump", t.name)
+finish:
+	c.inFlightMutex.Lock()
+	for _, msg := range c.inFlightMessages {
+		err := writeMessageToBackend(&amp;msgBuf, msg, c.backend)
+		if err != nil {
+			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+		}
+	}
+	c.inFlightMutex.Unlock()
+
+	c.deferredMutex.Lock()
+	for _, item := range c.deferredMessages {
+		msg := item.Value.(*Message)
+		err := writeMessageToBackend(&amp;msgBuf, msg, c.backend)
+		if err != nil {
+			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+		}
+	}
+	c.deferredMutex.Unlock()
+
+	return nil
 }
 
 
-在一个比较大的for循环里，messagePump对几类消息做了不同的处理
-
-  memoryMsgChan或者backendChan，表示真实的消息内容，区别在于后者是编码后存入磁盘的，所以需要多一道解码的工序。
-  channelUpdateChan，前面提到过，这里是用来刷新channel的。
-  pauseChan，pause和unpause都通过这个传进来，用于控制topic的消费。
-  exitChan，退出（想想之前waitGroup)。
-
-
-从memoryMsgChan或者backendChan拿到消息之后，自然是要写入channel的。根据消息是否deferred，有两种不同方式：
-
-  如果不是deferred，直接写入channel
-  否则写入channel的deferred priority queue
-
-
-这里有个小细节，因为要发送到n个channel，原本已经有一个message了，所以把这个message发送到第0个channel，可以减少一次复制的开销。
-从这里可以看到为什么每个channel都能获得所有消息了：他们得到的都是一份拷贝，并不是共享一份消息，这样各个channel之间就不会互相干扰了。
-退出
-topic有两种退出方式
-
-  被delete，这种情况下清空并删除所有channel，通知nsqlookupd本topic已经被删除了。
-  被正常close，这种情况下需要把所有数据都写入磁盘，然后关闭所有channel退出。
-
-
-全景图
-前面我们只是介绍了topic在整个生命周期中与别的部分进行的交互，但是还缺乏上层对topic的管理，下图描述了整个流程。
-
-
-注意图中consumer注册到nsqd可以发生在nsqd启动后的任意时刻。
-
+代码比较简单，就不赘述了。
 小结
-本文跟踪了nsqd中topic的整个生命周期，分析了topic与channel的交互流程。
-现在我们可以尝试着回答开始提出的问题的一小部分
+本文详细描述了NSQ的channel，大致总结成以下几点
 
-  堆积上限就是磁盘的大小，超过上限的处理策略需要参看diskqueue的处理。
-  单机情况下，每个channel都会收到每条消息的完整拷贝，所以不会丢失。多机的情况容以后分析。
+  channel的每一条消息至少发送一次，至多发送给一个consumer。
+  channel的消息是无序的。
+  client可以通过设置timeout、sampleRate、maxAttemptCount等参数来过滤接收到的消息。
+  写文章好累。
 
-
-接下来两篇文章将会分析diskqueue和channel。
 </div>
     </div>
 </div>
@@ -431,6 +510,14 @@ topic有两种退出方式
             
         </li>
         
+            
+        <li>
+            
+            
+            <a href="/article/6">6</a>
+            
+        </li>
+        
         <li>
             
             <a href="/article/3">
@@ -439,12 +526,12 @@ topic有两种退出方式
             
         </li>
         <li>
-            <a href="/article/5">
+            <a href="/article/6">
                 <span>末页</span>
             </a>
         </li>
         <li class="disabled">
-            <span>第2页 / 共5页</span>
+            <span>第2页 / 共6页</span>
         </li>
 </ul>
 

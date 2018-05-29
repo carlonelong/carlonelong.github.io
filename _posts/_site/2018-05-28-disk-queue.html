@@ -1,0 +1,314 @@
+<p>在<a href="../../09/17/nsq-topic">NSQ Topic</a>一文中提到了，当消息堆积太多时，NSQ会把部分消息写入一个backend。这个backend实际是一个叫做diskQueue的数据结构。本文主要分析该结构。</p>
+
+<p>同样，我们带着以下几个疑问来阅读代码。</p>
+<ol>
+  <li>NSQ会在什么情况下把数据写入/读出diskQueue?</li>
+  <li>diskQueue的数据是怎么存储的，如何保证数据正确读写？</li>
+</ol>
+
+<h2 id="diskqueue结构">diskQueue结构</h2>
+<p>照惯例先看一下diskQueue的数据结构</p>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">type</span><span class="x"> </span><span class="n">diskQueue</span><span class="x"> </span><span class="k">struct</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="c">// 64bit atomic vars need to be first for proper alignment on 32bit platforms</span><span class="x">
+
+	</span><span class="c">// run-time state (also persisted to disk)</span><span class="x">
+	</span><span class="n">readPos</span><span class="x">      </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">writePos</span><span class="x">     </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">readFileNum</span><span class="x">  </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">writeFileNum</span><span class="x"> </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">depth</span><span class="x">        </span><span class="kt">int64</span><span class="x">
+
+	</span><span class="n">sync</span><span class="o">.</span><span class="n">RWMutex</span><span class="x">
+
+	</span><span class="c">// instantiation time metadata</span><span class="x">
+	</span><span class="n">name</span><span class="x">            </span><span class="kt">string</span><span class="x">
+	</span><span class="n">dataPath</span><span class="x">        </span><span class="kt">string</span><span class="x">
+	</span><span class="n">maxBytesPerFile</span><span class="x"> </span><span class="kt">int64</span><span class="x"> </span><span class="c">// currently this cannot change once created</span><span class="x">
+	</span><span class="n">minMsgSize</span><span class="x">      </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">maxMsgSize</span><span class="x">      </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">syncEvery</span><span class="x">       </span><span class="kt">int64</span><span class="x">         </span><span class="c">// number of writes per fsync</span><span class="x">
+	</span><span class="n">syncTimeout</span><span class="x">     </span><span class="n">time</span><span class="o">.</span><span class="n">Duration</span><span class="x"> </span><span class="c">// duration of time per fsync</span><span class="x">
+	</span><span class="n">exitFlag</span><span class="x">        </span><span class="kt">int32</span><span class="x">
+	</span><span class="n">needSync</span><span class="x">        </span><span class="kt">bool</span><span class="x">
+
+	</span><span class="c">// keeps track of the position where we have read</span><span class="x">
+	</span><span class="c">// (but not yet sent over readChan)</span><span class="x">
+	</span><span class="n">nextReadPos</span><span class="x">     </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">nextReadFileNum</span><span class="x"> </span><span class="kt">int64</span><span class="x">
+
+	</span><span class="n">readFile</span><span class="x">  </span><span class="o">*</span><span class="n">os</span><span class="o">.</span><span class="n">File</span><span class="x">
+	</span><span class="n">writeFile</span><span class="x"> </span><span class="o">*</span><span class="n">os</span><span class="o">.</span><span class="n">File</span><span class="x">
+	</span><span class="n">reader</span><span class="x">    </span><span class="o">*</span><span class="n">bufio</span><span class="o">.</span><span class="n">Reader</span><span class="x">
+	</span><span class="n">writeBuf</span><span class="x">  </span><span class="n">bytes</span><span class="o">.</span><span class="n">Buffer</span><span class="x">
+
+	</span><span class="c">// exposed via ReadChan()</span><span class="x">
+	</span><span class="n">readChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="p">[]</span><span class="kt">byte</span><span class="x">
+
+	</span><span class="c">// internal channels</span><span class="x">
+	</span><span class="n">writeChan</span><span class="x">         </span><span class="k">chan</span><span class="x"> </span><span class="p">[]</span><span class="kt">byte</span><span class="x">
+	</span><span class="n">writeResponseChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="kt">error</span><span class="x">
+	</span><span class="n">emptyChan</span><span class="x">         </span><span class="k">chan</span><span class="x"> </span><span class="kt">int</span><span class="x">
+	</span><span class="n">emptyResponseChan</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="kt">error</span><span class="x">
+	</span><span class="n">exitChan</span><span class="x">          </span><span class="k">chan</span><span class="x"> </span><span class="kt">int</span><span class="x">
+	</span><span class="n">exitSyncChan</span><span class="x">      </span><span class="k">chan</span><span class="x"> </span><span class="kt">int</span><span class="x">
+
+	</span><span class="n">logf</span><span class="x"> </span><span class="n">AppLogFunc</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>可见其内部结构很简单，包括一些读写文件的指针，当前读（写）到的文件位置，每个文件允许的最大大小等。根据这些信息我们可以推测：</p>
+<ol>
+  <li>数据在diskQueue中是以磁盘文件形式存储的，并且这些文件的内容是连续的，可以通过不同的fileNum索引到。</li>
+  <li>这些文件的大小相近。</li>
+</ol>
+
+<h2 id="diskqueue的创建">diskQueue的创建</h2>
+<p>首先来看看diskQueue的创建流程，不出意外的话，会有一些load操作，比如读取当前正在读出（写入）数据的文件号，读（写）位置等。</p>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="n">New</span><span class="p">(</span><span class="n">name</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">dataPath</span><span class="x"> </span><span class="kt">string</span><span class="p">,</span><span class="x"> </span><span class="n">maxBytesPerFile</span><span class="x"> </span><span class="kt">int64</span><span class="p">,</span><span class="x">
+	</span><span class="n">minMsgSize</span><span class="x"> </span><span class="kt">int32</span><span class="p">,</span><span class="x"> </span><span class="n">maxMsgSize</span><span class="x"> </span><span class="kt">int32</span><span class="p">,</span><span class="x">
+	</span><span class="n">syncEvery</span><span class="x"> </span><span class="kt">int64</span><span class="p">,</span><span class="x"> </span><span class="n">syncTimeout</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">Duration</span><span class="p">,</span><span class="x"> </span><span class="n">logf</span><span class="x"> </span><span class="n">AppLogFunc</span><span class="p">)</span><span class="x"> </span><span class="n">Interface</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">d</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">diskQueue</span><span class="p">{</span><span class="x">
+		</span><span class="n">name</span><span class="o">:</span><span class="x">              </span><span class="n">name</span><span class="p">,</span><span class="x">
+		</span><span class="o">...</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="c">// no need to lock here, nothing else could possibly be touching this instance</span><span class="x">
+	</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">retrieveMetaData</span><span class="p">()</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="o">&amp;&amp;</span><span class="x"> </span><span class="o">!</span><span class="n">os</span><span class="o">.</span><span class="n">IsNotExist</span><span class="p">(</span><span class="n">err</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"DISKQUEUE(%s) failed to retrieveMetaData - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="k">go</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">ioLoop</span><span class="p">()</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="o">&amp;</span><span class="n">d</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>不出所料，果然会调用retrieveMetaData来load数据，我们看看“meta data”都包含什么。</p>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="x"> </span><span class="o">*</span><span class="n">diskQueue</span><span class="p">)</span><span class="x"> </span><span class="n">retrieveMetaData</span><span class="p">()</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">f</span><span class="x"> </span><span class="o">*</span><span class="n">os</span><span class="o">.</span><span class="n">File</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="kt">error</span><span class="x">
+
+	</span><span class="n">fileName</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">metaDataFileName</span><span class="p">()</span><span class="x">
+	</span><span class="n">f</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">os</span><span class="o">.</span><span class="n">OpenFile</span><span class="p">(</span><span class="n">fileName</span><span class="p">,</span><span class="x"> </span><span class="n">os</span><span class="o">.</span><span class="n">O_RDONLY</span><span class="p">,</span><span class="x"> </span><span class="m">0600</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="k">defer</span><span class="x"> </span><span class="n">f</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+
+	</span><span class="k">var</span><span class="x"> </span><span class="n">depth</span><span class="x"> </span><span class="kt">int64</span><span class="x">
+	</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">fmt</span><span class="o">.</span><span class="n">Fscanf</span><span class="p">(</span><span class="n">f</span><span class="p">,</span><span class="x"> </span><span class="s">"%d</span><span class="se">\n</span><span class="s">%d,%d</span><span class="se">\n</span><span class="s">%d,%d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="x">
+		</span><span class="o">&amp;</span><span class="n">depth</span><span class="p">,</span><span class="x">
+		</span><span class="o">&amp;</span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="p">,</span><span class="x"> </span><span class="o">&amp;</span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="p">,</span><span class="x">
+		</span><span class="o">&amp;</span><span class="n">d</span><span class="o">.</span><span class="n">writeFileNum</span><span class="p">,</span><span class="x"> </span><span class="o">&amp;</span><span class="n">d</span><span class="o">.</span><span class="n">writePos</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+	</span><span class="n">atomic</span><span class="o">.</span><span class="n">StoreInt64</span><span class="p">(</span><span class="o">&amp;</span><span class="n">d</span><span class="o">.</span><span class="n">depth</span><span class="p">,</span><span class="x"> </span><span class="n">depth</span><span class="p">)</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadFileNum</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadPos</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x">
+
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>答案很明显，包含当前diskQueue的消息数（depth），读（写）文件序号、读（写）位置。</p>
+
+<p>自然有load的地方，肯定有对应save的地方，即persistMetaData，其调用在sync中。至于sync干了什么，稍后分析。</p>
+
+<p>回到创建diskQueue的地方，除了retrieveMetaData之外，New还启动了一个ioLoop的goroutine。</p>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="x"> </span><span class="o">*</span><span class="n">diskQueue</span><span class="p">)</span><span class="x"> </span><span class="n">ioLoop</span><span class="p">()</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">dataRead</span><span class="x"> </span><span class="p">[]</span><span class="kt">byte</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="kt">error</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">count</span><span class="x"> </span><span class="kt">int64</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">r</span><span class="x"> </span><span class="k">chan</span><span class="x"> </span><span class="p">[]</span><span class="kt">byte</span><span class="x">
+
+	</span><span class="n">syncTicker</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">time</span><span class="o">.</span><span class="n">NewTicker</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">syncTimeout</span><span class="p">)</span><span class="x">
+
+	</span><span class="k">for</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="c">// dont sync all the time :)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">count</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">syncEvery</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">needSync</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">true</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">needSync</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">sync</span><span class="p">()</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="n">d</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"DISKQUEUE(%s) failed to sync - %s"</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">count</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="m">0</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="k">if</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="x"> </span><span class="o">&lt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writeFileNum</span><span class="p">)</span><span class="x"> </span><span class="o">||</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x"> </span><span class="o">&lt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writePos</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">nextReadPos</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="n">dataRead</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readOne</span><span class="p">()</span><span class="x">
+				</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+					</span><span class="n">d</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">ERROR</span><span class="p">,</span><span class="x"> </span><span class="s">"DISKQUEUE(%s) reading at %d of %s - %s"</span><span class="p">,</span><span class="x">
+						</span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">fileName</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="p">),</span><span class="x"> </span><span class="n">err</span><span class="p">)</span><span class="x">
+					</span><span class="n">d</span><span class="o">.</span><span class="n">handleReadError</span><span class="p">()</span><span class="x">
+					</span><span class="k">continue</span><span class="x">
+				</span><span class="p">}</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">r</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readChan</span><span class="x">
+		</span><span class="p">}</span><span class="x"> </span><span class="k">else</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">r</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="k">select</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="c">// the Go channel spec dictates that nil channel operations (read or write)</span><span class="x">
+		</span><span class="c">// in a select are skipped, we set r to d.readChan only when there is data to read</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="n">r</span><span class="x"> </span><span class="o">&lt;-</span><span class="x"> </span><span class="n">dataRead</span><span class="o">:</span><span class="x">
+			</span><span class="n">count</span><span class="o">++</span><span class="x">
+			</span><span class="c">// moveForward sets needSync flag if a file is removed</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">moveForward</span><span class="p">()</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">d</span><span class="o">.</span><span class="n">emptyChan</span><span class="o">:</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">emptyResponseChan</span><span class="x"> </span><span class="o">&lt;-</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">deleteAllFiles</span><span class="p">()</span><span class="x">
+			</span><span class="n">count</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="m">0</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="n">dataWrite</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">d</span><span class="o">.</span><span class="n">writeChan</span><span class="o">:</span><span class="x">
+			</span><span class="n">count</span><span class="o">++</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">writeResponseChan</span><span class="x"> </span><span class="o">&lt;-</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writeOne</span><span class="p">(</span><span class="n">dataWrite</span><span class="p">)</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">syncTicker</span><span class="o">.</span><span class="n">C</span><span class="o">:</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">count</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="c">// avoid sync when there's no activity</span><span class="x">
+				</span><span class="k">continue</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">needSync</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">true</span><span class="x">
+		</span><span class="k">case</span><span class="x"> </span><span class="o">&lt;-</span><span class="n">d</span><span class="o">.</span><span class="n">exitChan</span><span class="o">:</span><span class="x">
+			</span><span class="k">goto</span><span class="x"> </span><span class="n">exit</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+</span><span class="n">exit</span><span class="o">:</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">INFO</span><span class="p">,</span><span class="x"> </span><span class="s">"DISKQUEUE(%s): closing ... ioLoop"</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">)</span><span class="x">
+	</span><span class="n">syncTicker</span><span class="o">.</span><span class="n">Stop</span><span class="p">()</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">exitSyncChan</span><span class="x"> </span><span class="o">&lt;-</span><span class="x"> </span><span class="m">1</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>ioLoop的逻辑稍微复杂一些，包括几部分</p>
+<ol>
+  <li>如果需要同步，调用sync。</li>
+  <li>如果有内容可读，则读取数据。</li>
+  <li>监听若干chan，根据不同消息做出不同响应。</li>
+</ol>
+
+<h3 id="同步">同步</h3>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="x"> </span><span class="o">*</span><span class="n">diskQueue</span><span class="p">)</span><span class="x"> </span><span class="n">sync</span><span class="p">()</span><span class="x"> </span><span class="kt">error</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writeFile</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writeFile</span><span class="o">.</span><span class="n">Sync</span><span class="p">()</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">writeFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">writeFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+			</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">err</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">persistMetaData</span><span class="p">()</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">d</span><span class="o">.</span><span class="n">needSync</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">false</span><span class="x">
+	</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>这里可以看到sync函数做的事情很简单：</p>
+<ol>
+  <li>如果writeFile存在，刷新其内容到磁盘。</li>
+  <li>保存元数据。</li>
+</ol>
+
+<p>我们比较关心的是sync合适会被调用，跟踪needSync变量可知，有3种情况会触发同步。</p>
+<ol>
+  <li>定时器触发，diskQueue会定期触发sync操作以保证数据正确性。</li>
+  <li>读写一定数目（syncEvery）之后触发。</li>
+  <li>一些特殊的读写事件，包括读取文件变化，读写失败等。</li>
+</ol>
+
+<h3 id="读数据">读数据</h3>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">if</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="x"> </span><span class="o">&lt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writeFileNum</span><span class="p">)</span><span class="x"> </span><span class="o">||</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x"> </span><span class="o">&lt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">writePos</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="o">...</span><span class="x">
+	</span><span class="n">r</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readChan</span><span class="x">
+</span><span class="p">}</span><span class="x"> </span><span class="k">else</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="n">r</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
+<p>这里有个很有意思的设置，如果当前可读，则将r设置为readChan，否则设置为nil。</p>
+
+<p>在select中，空的chan会被跳过</p>
+
+<p>所以如果读到数据，会写入readChan；否则会直接跳过。
+来看看真正的读数据操作。</p>
+<div class="language-go highlighter-rouge"><pre class="highlight"><code><span class="k">func</span><span class="x"> </span><span class="p">(</span><span class="n">d</span><span class="x"> </span><span class="o">*</span><span class="n">diskQueue</span><span class="p">)</span><span class="x"> </span><span class="n">readOne</span><span class="p">()</span><span class="x"> </span><span class="p">([]</span><span class="kt">byte</span><span class="p">,</span><span class="x"> </span><span class="kt">error</span><span class="p">)</span><span class="x"> </span><span class="p">{</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="kt">error</span><span class="x">
+	</span><span class="k">var</span><span class="x"> </span><span class="n">msgSize</span><span class="x"> </span><span class="kt">int32</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">==</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">curFileName</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">fileName</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="p">)</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">os</span><span class="o">.</span><span class="n">OpenFile</span><span class="p">(</span><span class="n">curFileName</span><span class="p">,</span><span class="x"> </span><span class="n">os</span><span class="o">.</span><span class="n">O_RDONLY</span><span class="p">,</span><span class="x"> </span><span class="m">0600</span><span class="p">)</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="n">d</span><span class="o">.</span><span class="n">logf</span><span class="p">(</span><span class="n">INFO</span><span class="p">,</span><span class="x"> </span><span class="s">"DISKQUEUE(%s): readOne() opened %s"</span><span class="p">,</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">,</span><span class="x"> </span><span class="n">curFileName</span><span class="p">)</span><span class="x">
+
+		</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="m">0</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Seek</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="p">,</span><span class="x"> </span><span class="m">0</span><span class="p">)</span><span class="x">
+			</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+				</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+				</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+				</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x">
+			</span><span class="p">}</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="n">d</span><span class="o">.</span><span class="n">reader</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">bufio</span><span class="o">.</span><span class="n">NewReader</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">binary</span><span class="o">.</span><span class="n">Read</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">reader</span><span class="p">,</span><span class="x"> </span><span class="n">binary</span><span class="o">.</span><span class="n">BigEndian</span><span class="p">,</span><span class="x"> </span><span class="o">&amp;</span><span class="n">msgSize</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="k">if</span><span class="x"> </span><span class="n">msgSize</span><span class="x"> </span><span class="o">&lt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">minMsgSize</span><span class="x"> </span><span class="o">||</span><span class="x"> </span><span class="n">msgSize</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">maxMsgSize</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="c">// this file is corrupt and we have no reasonable guarantee on</span><span class="x">
+		</span><span class="c">// where a new message should begin</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="p">,</span><span class="x"> </span><span class="n">fmt</span><span class="o">.</span><span class="n">Errorf</span><span class="p">(</span><span class="s">"invalid message read size (%d)"</span><span class="p">,</span><span class="x"> </span><span class="n">msgSize</span><span class="p">)</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">readBuf</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="nb">make</span><span class="p">([]</span><span class="kt">byte</span><span class="p">,</span><span class="x"> </span><span class="n">msgSize</span><span class="p">)</span><span class="x">
+	</span><span class="n">_</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">io</span><span class="o">.</span><span class="n">ReadFull</span><span class="p">(</span><span class="n">d</span><span class="o">.</span><span class="n">reader</span><span class="p">,</span><span class="x"> </span><span class="n">readBuf</span><span class="p">)</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">err</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+		</span><span class="k">return</span><span class="x"> </span><span class="no">nil</span><span class="p">,</span><span class="x"> </span><span class="n">err</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="n">totalBytes</span><span class="x"> </span><span class="o">:=</span><span class="x"> </span><span class="kt">int64</span><span class="p">(</span><span class="m">4</span><span class="x"> </span><span class="o">+</span><span class="x"> </span><span class="n">msgSize</span><span class="p">)</span><span class="x">
+
+	</span><span class="c">// we only advance next* because we have not yet sent this to consumers</span><span class="x">
+	</span><span class="c">// (where readFileNum, readPos will actually be advanced)</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadPos</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readPos</span><span class="x"> </span><span class="o">+</span><span class="x"> </span><span class="n">totalBytes</span><span class="x">
+	</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadFileNum</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readFileNum</span><span class="x">
+
+	</span><span class="c">// TODO: each data file should embed the maxBytesPerFile</span><span class="x">
+	</span><span class="c">// as the first 8 bytes (at creation time) ensuring that</span><span class="x">
+	</span><span class="c">// the value can change without affecting runtime</span><span class="x">
+	</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">nextReadPos</span><span class="x"> </span><span class="o">&gt;</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">maxBytesPerFile</span><span class="x"> </span><span class="p">{</span><span class="x">
+		</span><span class="k">if</span><span class="x"> </span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">!=</span><span class="x"> </span><span class="no">nil</span><span class="x"> </span><span class="p">{</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="o">.</span><span class="n">Close</span><span class="p">()</span><span class="x">
+			</span><span class="n">d</span><span class="o">.</span><span class="n">readFile</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="no">nil</span><span class="x">
+		</span><span class="p">}</span><span class="x">
+
+		</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadFileNum</span><span class="o">++</span><span class="x">
+		</span><span class="n">d</span><span class="o">.</span><span class="n">nextReadPos</span><span class="x"> </span><span class="o">=</span><span class="x"> </span><span class="m">0</span><span class="x">
+	</span><span class="p">}</span><span class="x">
+
+	</span><span class="k">return</span><span class="x"> </span><span class="n">readBuf</span><span class="p">,</span><span class="x"> </span><span class="no">nil</span><span class="x">
+</span><span class="p">}</span><span class="x">
+</span></code></pre>
+</div>
